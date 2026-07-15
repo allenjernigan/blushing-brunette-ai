@@ -94,48 +94,114 @@ function draftToHtml(draft) {
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const html = [];
-  let bulletItems = [];
+  const sections = {
+    title: "",
+    opening: [],
+    why: [],
+    details: [],
+    sizing: [],
+    closing: [],
+  };
 
-  function flushBullets() {
-    if (!bulletItems.length) return;
+  let currentSection = "title";
 
-    html.push(
-      `<ul>${bulletItems
-        .map((item) => `<li>${escapeHtml(item)}</li>`)
-        .join("")}</ul>`,
-    );
+  for (const line of lines) {
+    const normalized = line
+      .replace(/[*_#]/g, "")
+      .replace(/:$/, "")
+      .trim()
+      .toLowerCase();
 
-    bulletItems = [];
+    if (normalized === "why you'll love it") {
+      currentSection = "why";
+      continue;
+    }
+
+    if (normalized === "fit & details" || normalized === "fit and details") {
+      currentSection = "details";
+      continue;
+    }
+
+    if (normalized === "sizing") {
+      currentSection = "sizing";
+      continue;
+    }
+
+    if (currentSection === "title") {
+      sections.title = line.replace(/[*_#]/g, "").trim();
+      currentSection = "opening";
+      continue;
+    }
+
+    if (currentSection === "why") {
+      sections.why.push(line.replace(/^[•*-]\s*/, "").trim());
+      continue;
+    }
+
+    if (currentSection === "details") {
+      sections.details.push(line.replace(/^[•*-]\s*/, "").trim());
+      continue;
+    }
+
+    if (currentSection === "sizing") {
+      const looksLikeSizing =
+        /^[a-zA-Z0-9+/ -]+\s*:\s*/.test(line) ||
+        /^(small|medium|large|x-large|xl|1x|2x|3x|one size)\b/i.test(line);
+
+      if (looksLikeSizing) {
+        sections.sizing.push(line.replace(/^[•*-]\s*/, "").trim());
+      } else {
+        currentSection = "closing";
+        sections.closing.push(line);
+      }
+
+      continue;
+    }
+
+    sections[currentSection].push(line);
   }
 
-  lines.forEach((line, index) => {
-    const isBullet = /^[•*-]\s+/.test(line);
+  const html = [];
 
-    if (isBullet) {
-      bulletItems.push(line.replace(/^[•*-]\s+/, ""));
-      return;
-    }
+  if (sections.title) {
+    html.push(`<p><strong>${escapeHtml(sections.title)}</strong></p>`);
+  }
 
-    flushBullets();
+  if (sections.opening.length) {
+    html.push(`<p>${escapeHtml(sections.opening.join(" "))}</p>`);
+  }
 
-    const normalized = line.toLowerCase();
+  if (sections.why.length) {
+    html.push(`<p><strong>Why You'll Love It</strong></p>`);
 
-    const isSectionHeading =
-      normalized === "why you'll love it" ||
-      normalized === "fit & details" ||
-      normalized === "sizing" ||
-      normalized === "fit note";
+    html.push(
+      `<p>${sections.why
+        .map((item) => `• ${escapeHtml(item)}`)
+        .join("<br>")}</p>`,
+    );
+  }
 
-    if (index === 0 || isSectionHeading) {
-      html.push(`<p><strong>${escapeHtml(line)}</strong></p>`);
-      return;
-    }
+  if (sections.details.length) {
+    html.push(`<p><strong>Fit &amp; Details</strong></p>`);
 
-    html.push(`<p>${escapeHtml(line)}</p>`);
-  });
+    html.push(
+      `<p>${sections.details
+        .map((item) => `• ${escapeHtml(item)}`)
+        .join("<br>")}</p>`,
+    );
+  }
 
-  flushBullets();
+  if (sections.sizing.length) {
+    html.push(`<p><strong>Sizing</strong></p>`);
+
+    html.push(
+      `<p>${sections.sizing.map((item) => escapeHtml(item)).join("<br>")}</p>`,
+    );
+  }
+
+  if (sections.closing.length) {
+    html.push(`<p>${escapeHtml(sections.closing.join(" "))}</p>`);
+  }
 
   return html.join("");
 }
