@@ -1,0 +1,56 @@
+# Blushing Brunette AI
+
+## Mission
+
+Build the internal operating system for Blushing Brunette.
+
+The application should help manage:
+
+- Merchandising
+- Finance
+- Marketing
+- Inventory
+- Product Pages
+- Analytics
+
+Every feature should save time or improve decision-making.
+
+The app is not intended to replace Shopify or accounting software.
+It should sit on top of them and provide intelligence.
+
+---
+
+## Version 1 Goals
+
+### Merchandising
+
+- Product descriptions
+- SEO
+- Alt text
+- Founder Fit
+- Product readiness score
+
+### Finance
+
+- Daily profit
+- Cash flow
+- Inventory valuation
+- Break-even ROAS
+- Forecasting
+
+### Marketing
+
+- Email
+- SMS
+- Meta Ads
+- Social captions
+- UGC scripts
+
+---
+
+## Core Principles
+
+- Never invent product facts.
+- Verified information always wins.
+- Human approval before publishing.
+- Every recommendation should explain why.
