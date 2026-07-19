@@ -326,40 +326,71 @@ export function parseShopifyqlResult(json) {
   return result.tableData.rows || [];
 }
 
-async function runShopifyql(admin, query) {
-  const response = await executeFinanceGraphql(
-    admin,
-    "FinanceShopifyql",
-    `#graphql
-      query FinanceShopifyql($query: String!) {
-        shopifyqlQuery(query: $query) {
-          parseErrors
-          tableData {
-            columns {
-              name
-              dataType
-              displayName
-            }
-            rows
-          }
-        }
-      }
-    `,
-    { variables: { query } },
+async function runShopifyql(admin, shopifyqlQueryString, dateInputs) {
+  console.error(
+    "[Finance ShopifyQL query]",
+    shopifyqlQueryString,
+  );
+  console.error(
+    "[Finance ShopifyQL date inputs]",
+    JSON.stringify(dateInputs, null, 2),
   );
 
-  return parseShopifyqlResult(await response.json());
+  try {
+    const response = await executeFinanceGraphql(
+      admin,
+      "FinanceShopifyql",
+      `#graphql
+        query FinanceShopifyql($query: String!) {
+          shopifyqlQuery(query: $query) {
+            parseErrors
+            tableData {
+              columns {
+                name
+                dataType
+                displayName
+              }
+              rows
+            }
+          }
+        }
+      `,
+      { variables: { query: shopifyqlQueryString } },
+    );
+
+    return parseShopifyqlResult(await response.json());
+  } catch (error) {
+    const expandedGraphQLErrors = Array.isArray(error?.graphQLErrors)
+      ? error.graphQLErrors.map((item) => ({
+          message: item?.message ?? null,
+          path: item?.path ?? null,
+          locations: item?.locations ?? null,
+          extensions: item?.extensions
+            ? JSON.parse(JSON.stringify(item.extensions))
+            : null,
+        }))
+      : [];
+
+    console.error(
+      "[Finance GraphQL errors expanded]",
+      JSON.stringify(expandedGraphQLErrors, null, 2),
+    );
+    throw error;
+  }
 }
 
 async function getSalesChannels(admin) {
-  const rows = await runShopifyql(
-    admin,
-    `FROM sales
+  const shopifyqlQueryString = `FROM sales
       SHOW total_sales, orders
       GROUP BY sales_channel, is_pos_sale
       SINCE 2000-01-01 UNTIL today
-      ORDER BY total_sales DESC`,
-  );
+      ORDER BY total_sales DESC`;
+  const rows = await runShopifyql(admin, shopifyqlQueryString, {
+    period: "channel-discovery",
+    start: "2000-01-01",
+    end: "today",
+    dateClause: "SINCE 2000-01-01 UNTIL today",
+  });
 
   const channelsByKey = new Map();
 
@@ -384,10 +415,13 @@ async function getSalesChannels(admin) {
 }
 
 async function getPeriodChannelSales(admin, period) {
-  const rows = await runShopifyql(
-    admin,
-    buildPeriodSalesQuery(period),
-  );
+  const shopifyqlQueryString = buildPeriodSalesQuery(period);
+  const rows = await runShopifyql(admin, shopifyqlQueryString, {
+    period: period.key,
+    start: period.startDate,
+    end: period.endDate,
+    dateClause: `SINCE ${period.startDate} UNTIL ${period.endDate}`,
+  });
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
