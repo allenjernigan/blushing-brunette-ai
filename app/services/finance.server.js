@@ -123,13 +123,61 @@ export async function executeFinanceGraphql(
       JSON.stringify(expandedGraphQLErrors, null, 2),
     );
     console.error("[Finance GraphQL operation]", operationName);
-    console.error(
-      "[Finance GraphQL wrapper message]",
-      error?.message,
-    );
     throw error;
   }
 }
+
+function isSameDayCustomRequest(periodKey, customStart, customEnd) {
+  return (
+    periodKey === "custom" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(customStart || "") &&
+    customStart === customEnd
+  );
+}
+
+function logFinanceOperation(operationName, shopifyqlQueryString) {
+  console.error("[Finance GraphQL operation]", operationName);
+
+  if (shopifyqlQueryString) {
+    console.error(
+      "[Finance ShopifyQL query]",
+      shopifyqlQueryString,
+    );
+  }
+}
+
+const SHOPIFYQL_GRAPHQL_OPERATIONS = {
+  FinanceChannels: `#graphql
+    query FinanceChannels($query: String!) {
+      shopifyqlQuery(query: $query) {
+        parseErrors
+        tableData {
+          columns {
+            name
+            dataType
+            displayName
+          }
+          rows
+        }
+      }
+    }
+  `,
+  FinanceSalesTotals: `#graphql
+    query FinanceSalesTotals($query: String!) {
+      shopifyqlQuery(query: $query) {
+        parseErrors
+        tableData {
+          columns {
+            name
+            dataType
+            displayName
+          }
+          rows
+        }
+      }
+    }
+  `,
+};
 
 export function normalizeSourceName(sourceName) {
   return String(sourceName || "")
@@ -272,7 +320,9 @@ function calculateProductCosts(orders) {
   };
 }
 
-async function getShopSettings(admin) {
+async function getShopSettings(admin, diagnostic = false) {
+  if (diagnostic) logFinanceOperation("FinanceShopSettings");
+
   const response = await executeFinanceGraphql(
     admin,
     "FinanceShopSettings",
@@ -326,30 +376,43 @@ export function parseShopifyqlResult(json) {
   return result.tableData.rows || [];
 }
 
-async function runShopifyql(admin, shopifyqlQueryString) {
+async function runShopifyql(
+  admin,
+  operationName,
+  shopifyqlQueryString,
+  diagnostic = false,
+) {
+  if (diagnostic) {
+    logFinanceOperation(operationName, shopifyqlQueryString);
+  }
+
   try {
-    const response = await executeFinanceGraphql(
-      admin,
-      "FinanceShopifyql",
-      `#graphql
-        query FinanceShopifyql($query: String!) {
-          shopifyqlQuery(query: $query) {
-            parseErrors
-            tableData {
-              columns {
-                name
-                dataType
-                displayName
-              }
-              rows
-            }
-          }
-        }
-      `,
+    const graphqlOperation =
+      SHOPIFYQL_GRAPHQL_OPERATIONS[operationName];
+
+    if (!graphqlOperation) {
+      throw new Error(
+        `Unknown Finance ShopifyQL operation: ${operationName}`,
+      );
+    }
+
+    const response = await admin.graphql(
+      graphqlOperation,
       { variables: { query: shopifyqlQueryString } },
     );
+    const json = await response.json();
+    const parseErrors = json.data?.shopifyqlQuery?.parseErrors || [];
 
-    return parseShopifyqlResult(await response.json());
+    if (parseErrors.length) {
+      console.error("[Finance GraphQL operation]", operationName);
+      console.error("[Finance ShopifyQL query]", shopifyqlQueryString);
+      console.error(
+        "[Finance ShopifyQL parseErrors]",
+        JSON.stringify(parseErrors, null, 2),
+      );
+    }
+
+    return parseShopifyqlResult(json);
   } catch (error) {
     const expandedGraphQLErrors = Array.isArray(error?.graphQLErrors)
       ? error.graphQLErrors.map((item) => ({
@@ -366,17 +429,24 @@ async function runShopifyql(admin, shopifyqlQueryString) {
       "[Finance GraphQL errors expanded]",
       JSON.stringify(expandedGraphQLErrors, null, 2),
     );
+    console.error("[Finance GraphQL operation]", operationName);
+    console.error("[Finance ShopifyQL query]", shopifyqlQueryString);
     throw error;
   }
 }
 
-async function getSalesChannels(admin) {
+async function getSalesChannels(admin, diagnostic = false) {
   const shopifyqlQueryString = `FROM sales
       SHOW total_sales, orders
       GROUP BY sales_channel, is_pos_sale
       SINCE 2000-01-01 UNTIL today
       ORDER BY total_sales DESC`;
-  const rows = await runShopifyql(admin, shopifyqlQueryString);
+  const rows = await runShopifyql(
+    admin,
+    "FinanceChannels",
+    shopifyqlQueryString,
+    diagnostic,
+  );
 
   const channelsByKey = new Map();
 
@@ -400,9 +470,14 @@ async function getSalesChannels(admin) {
   return Array.from(channelsByKey.values());
 }
 
-async function getPeriodChannelSales(admin, period) {
+async function getPeriodChannelSales(admin, period, diagnostic = false) {
   const shopifyqlQueryString = buildFinanceSalesQuery(period);
-  const rows = await runShopifyql(admin, shopifyqlQueryString);
+  const rows = await runShopifyql(
+    admin,
+    "FinanceSalesTotals",
+    shopifyqlQueryString,
+    diagnostic,
+  );
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
@@ -410,7 +485,7 @@ async function getPeriodChannelSales(admin, period) {
   }));
 }
 
-async function getOrdersForRange(admin, start, end) {
+async function getOrdersForRange(admin, start, end, diagnostic = false) {
   const orders = [];
   let hasNextPage = true;
   let cursor = null;
@@ -418,6 +493,8 @@ async function getOrdersForRange(admin, start, end) {
   const searchQuery = buildProcessedAtRangeQuery(start, end);
 
   while (hasNextPage) {
+    if (diagnostic) logFinanceOperation("FinanceOrders");
+
     const response = await executeFinanceGraphql(
       admin,
       "FinanceOrders",
@@ -625,6 +702,7 @@ async function getOrdersForRange(admin, start, end) {
         order.id,
         order.lineItems.nodes,
         order.lineItems.pageInfo,
+        diagnostic,
       );
 
       if (isOrderWithinDateRange(order, start, end)) {
@@ -644,12 +722,15 @@ async function getRemainingOrderLineItems(
   orderId,
   initialItems,
   initialPageInfo,
+  diagnostic = false,
 ) {
   const lineItems = [...initialItems];
   let hasNextPage = initialPageInfo.hasNextPage;
   let cursor = initialPageInfo.endCursor;
 
   while (hasNextPage) {
+    if (diagnostic) logFinanceOperation("FinanceOrderLineItems");
+
     const response = await executeFinanceGraphql(
       admin,
       "FinanceOrderLineItems",
@@ -747,8 +828,13 @@ export async function getFinanceSales(
     requestedChannels = null,
   } = {},
 ) {
-  const shop = await getShopSettings(admin);
-  const channels = await getSalesChannels(admin);
+  const sameDayCustom = isSameDayCustomRequest(
+    periodKey,
+    customStart,
+    customEnd,
+  );
+  const shop = await getShopSettings(admin, sameDayCustom);
+  const channels = await getSalesChannels(admin, sameDayCustom);
   const channelByKey = new Map(
     channels.map((channel) => [channel.key, channel]),
   );
@@ -784,12 +870,29 @@ export async function getFinanceSales(
     };
   }
 
-  const [rawOrders, shopifyChannelSales] = dateError
-    ? [[], []]
-    : await Promise.all([
+  let rawOrders = [];
+  let shopifyChannelSales = [];
+
+  if (!dateError) {
+    if (sameDayCustom) {
+      shopifyChannelSales = await getPeriodChannelSales(
+        admin,
+        period,
+        true,
+      );
+      rawOrders = await getOrdersForRange(
+        admin,
+        period.start,
+        period.end,
+        true,
+      );
+    } else {
+      [rawOrders, shopifyChannelSales] = await Promise.all([
         getOrdersForRange(admin, period.start, period.end),
         getPeriodChannelSales(admin, period),
       ]);
+    }
+  }
   const allOrders = rawOrders.map((order) =>
     withChannelClassification(order, channelByKey),
   );
@@ -840,7 +943,9 @@ export async function getFinanceSales(
     selectedChannels,
     shopifyMetrics: aggregateSalesMetrics(
       shopifyChannelSales,
-      selectedChannels,
+      sameDayCustom
+        ? shopifyChannelSales.map((summary) => summary.channel.key)
+        : selectedChannels,
     ),
     channelBreakdown,
     dateError,

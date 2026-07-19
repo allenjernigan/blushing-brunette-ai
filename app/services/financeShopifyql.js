@@ -22,10 +22,9 @@ export function buildPeriodSalesQuery(period) {
 
 export function buildSingleDaySalesQuery(date) {
   return `FROM sales
-      SHOW ${SHOPIFY_SALES_METRICS.join(", ")}
-      GROUP BY sales_channel
+      SHOW gross_sales, discounts, sales_reversals, net_sales, shipping_charges, shipping_reversals, taxes, total_sales
       SINCE ${date} UNTIL ${date}
-      ORDER BY total_sales DESC`;
+  `;
 }
 
 export function buildFinanceSalesQuery(period) {

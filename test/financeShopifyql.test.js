@@ -49,6 +49,11 @@ test("builds a dedicated absolute single-day ShopifyQL query", () => {
   });
 
   assert.match(query, /SINCE 2026-07-16 UNTIL 2026-07-16/);
+  assert.match(
+    query,
+    /SHOW gross_sales, discounts, sales_reversals, net_sales, shipping_charges, shipping_reversals, taxes, total_sales/,
+  );
+  assert.doesNotMatch(query, /GROUP BY|duties|additional_fees|average_order_value/);
   assert.doesNotMatch(query, /2026-07-15|2026-07-17|T00:00|Z/);
 });
 
@@ -240,10 +245,7 @@ test("Finance GraphQL logging rethrows the original error", async () => {
       "[Finance GraphQL operation]",
       "FinanceOrders",
     ]);
-    assert.deepEqual(loggedCalls[2], [
-      "[Finance GraphQL wrapper message]",
-      "Network failure",
-    ]);
+    assert.equal(loggedCalls.length, 2);
   } finally {
     console.error = originalConsoleError;
   }
