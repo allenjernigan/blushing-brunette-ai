@@ -1,5 +1,5 @@
 import { useLoaderData, useRouteError } from "react-router";
-import { boundary } from "@Shopify/shopify-app-react-router/server";
+import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 
 export const loader = async ({ request }) => {

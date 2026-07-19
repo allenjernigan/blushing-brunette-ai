@@ -9,26 +9,159 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
 model Session {
-  id            String    @id
-  shop          String
-  state         String
-  isOnline      Boolean   @default(false)
-  scope         String?
-  expires       DateTime?
-  accessToken   String
-  userId        BigInt?
-  firstName     String?
-  lastName      String?
-  email         String?
-  accountOwner  Boolean   @default(false)
-  locale        String?
-  collaborator  Boolean?  @default(false)
-  emailVerified Boolean?  @default(false)
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
   refreshToken        String?
   refreshTokenExpires DateTime?
+}
+
+model ShopSettings {
+  id                                 Int      @id @default(autoincrement())
+  shop                               String   @unique
+  ecommerceShippingCost              Decimal  @default(6.00)
+  posShippingCost                    Decimal  @default(6.00)
+  paymentProcessingPercentage        Decimal  @default(0)
+  paymentProcessingFixedFee          Decimal  @default(0)
+  ecommerceProcessingPercentage      Decimal  @default(0)
+  ecommerceProcessingFixedFee        Decimal  @default(0)
+  posProcessingPercentage            Decimal  @default(0)
+  posProcessingFixedFee              Decimal  @default(0)
+  monthlyFixedOperatingExpenses      Decimal  @default(17000)
+  targetContributionMarginPercentage Decimal  @default(20)
+  targetRoas                         Decimal  @default(2.5)
+  defaultFinanceChannel              String   @default("ecommerce")
+  createdAt                          DateTime @default(now())
+  updatedAt                          DateTime @updatedAt
+}
+
+model Product {
+  id               Int       @id @default(autoincrement())
+  shop             String
+  shopifyProductId String
+  title            String
+  handle           String?
+  status           String?
+  vendor           String?
+  productType      String?
+  createdAtShopify DateTime?
+  updatedAtShopify DateTime?
+  syncedAt         DateTime  @default(now())
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  variants Variant[]
+
+  @@unique([shop, shopifyProductId])
+  @@index([shop])
+  @@index([title])
+}
+
+model Variant {
+  id                     Int       @id @default(autoincrement())
+  shop                   String
+  shopifyVariantId       String
+  shopifyInventoryItemId String?
+  productId              Int
+  title                  String
+  sku                    String?
+  barcode                String?
+  price                  Decimal?
+  compareAtPrice         Decimal?
+  unitCost               Decimal?
+  inventoryQuantity      Int?
+  costStatus             String    @default("MISSING")
+  costUpdatedAt          DateTime?
+  syncedAt               DateTime  @default(now())
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+
+  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
+  orderLines OrderLine[]
+
+  @@unique([shop, shopifyVariantId])
+  @@index([shop])
+  @@index([productId])
+  @@index([sku])
+  @@index([costStatus])
+}
+
+model Order {
+  id                Int       @id @default(autoincrement())
+  shop              String
+  shopifyOrderId    String
+  orderName         String
+  processedAt       DateTime
+  createdAtShopify  DateTime?
+  cancelledAt       DateTime?
+  financialStatus   String?
+  currencyCode      String
+  grossProductSales Decimal   @default(0)
+  discounts         Decimal   @default(0)
+  netProductSales   Decimal   @default(0)
+  shippingCollected Decimal   @default(0)
+  taxesCollected    Decimal   @default(0)
+  totalSales        Decimal   @default(0)
+  cogsStatus        String    @default("INCOMPLETE")
+  totalCogs         Decimal?
+  grossProfit       Decimal?
+  syncedAt          DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  lineItems OrderLine[]
+
+  @@unique([shop, shopifyOrderId])
+  @@index([shop])
+  @@index([processedAt])
+  @@index([cogsStatus])
+}
+
+model OrderLine {
+  id                  Int      @id @default(autoincrement())
+  shop                String
+  shopifyLineItemId   String
+  orderId             Int
+  variantId           Int?
+  shopifyVariantId    String?
+  title               String
+  variantTitle        String?
+  sku                 String?
+  originalQuantity    Int
+  currentQuantity     Int
+  originalUnitPrice   Decimal  @default(0)
+  discountedUnitPrice Decimal  @default(0)
+  netSales            Decimal  @default(0)
+  unitCostAtSale      Decimal?
+  totalCostAtSale     Decimal?
+  costStatus          String   @default("MISSING")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant Variant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+
+  @@unique([shop, shopifyLineItemId])
+  @@index([shop])
+  @@index([orderId])
+  @@index([variantId])
+  @@index([shopifyVariantId])
+  @@index([costStatus])
 }

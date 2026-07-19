@@ -1,5 +1,6 @@
 import { auditProduct } from "../services/productAudit";
 import { useEffect, useState } from "react";
+import process from "node:process";
 import {
   useFetcher,
   useLoaderData,
@@ -224,7 +225,8 @@ export const loader = async ({ request }) => {
   };
 };
 export const action = async ({ request }) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } =
+    await authenticate.admin(request);
   const formData = await request.formData();
 
   const productId = formData.get("productId");
@@ -255,6 +257,21 @@ export const action = async ({ request }) => {
     }
 
     if (intent === "publish") {
+      const isLiveStore =
+        session.shop ===
+        "the-blushing-brunette.myshopify.com";
+      const liveWritesEnabled =
+        process.env.ALLOW_LIVE_PRODUCT_WRITES === "true";
+
+      if (isLiveStore && !liveWritesEnabled) {
+        return {
+          ok: false,
+          intent: "publish",
+          error:
+            "Publishing is disabled on the live store until live writes are explicitly enabled.",
+        };
+      }
+
       const draft = formData.get("draft");
 
       if (typeof draft !== "string" || !draft.trim()) {

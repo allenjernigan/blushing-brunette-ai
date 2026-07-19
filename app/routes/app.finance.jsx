@@ -1,11 +1,25 @@
 import {
+  Form,
   Link,
+  useActionData,
   useLoaderData,
+  useNavigation,
   useRouteError,
 } from "react-router";
-import { boundary } from "@Shopify/shopify-app-react-router/server";
+import PropTypes from "prop-types";
+import {
+  syncOrders,
+  syncProducts,
+} from "../services/sync.server";
+import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { getFinanceSales } from "../services/finance.server";
+import {
+  FINANCE_CHANNELS,
+  getOrCreateShopSettings,
+  serializeShopSettings,
+} from "../services/settings.server";
+import prisma from "../db.server";
 
 const PERIODS = [
   {
@@ -25,6 +39,18 @@ const PERIODS = [
     label: "Last Month",
   },
 ];
+
+const CHANNEL_OPTIONS = [
+  { key: "ecommerce", label: "Ecommerce" },
+  { key: "pos", label: "POS" },
+  { key: "all", label: "All Channels" },
+];
+
+const CHANNEL_CONTEXT = {
+  ecommerce: "Ecommerce only",
+  pos: "POS only",
+  all: "All channels",
+};
 
 function money(value, currencyCode = "USD") {
   return new Intl.NumberFormat("en-US", {
@@ -55,6 +81,10 @@ function countUnitsSold(orders) {
 
     return total + orderUnits;
   }, 0);
+}
+
+function getOrderCurrentUnits(order) {
+  return countUnitsSold([order]);
 }
 
 function calculateGrossProductSales(orders) {
@@ -88,9 +118,504 @@ function isValidPeriod(period) {
   );
 }
 
-export const loader = async ({ request }) => {
-  const { admin } =
+function isValidChannel(channel) {
+  return FINANCE_CHANNELS.includes(channel);
+}
+
+function classifyShippingEligibility(order) {
+  const hasCurrentUnits = getOrderCurrentUnits(order) > 0;
+
+  if (order.salesChannel === "ecommerce") {
+    return !order.cancelledAt && hasCurrentUnits
+      ? "ecommerce-shipment"
+      : "excluded";
+  }
+
+  if (order.cancelledAt || !hasCurrentUnits) {
+    return "excluded";
+  }
+
+  const isFulfilled = [
+    "FULFILLED",
+    "PARTIALLY_FULFILLED",
+  ].includes(order.displayFulfillmentStatus);
+
+  if (order.requiresShipping === true && isFulfilled) {
+    return "pos-shipment";
+  }
+
+  if (
+    order.requiresShipping === false &&
+    order.retailLocation
+  ) {
+    return "pos-walkout";
+  }
+
+  return "ambiguous";
+}
+
+function calculateEstimatedShipping(orders, settings) {
+  const counts = {
+    ecommerceShipments: 0,
+    posShipments: 0,
+    posWalkouts: 0,
+    ambiguous: 0,
+  };
+
+  for (const order of orders) {
+    const eligibility = classifyShippingEligibility(order);
+
+    if (eligibility === "ecommerce-shipment") {
+      counts.ecommerceShipments += 1;
+    } else if (eligibility === "pos-shipment") {
+      counts.posShipments += 1;
+    } else if (eligibility === "pos-walkout") {
+      counts.posWalkouts += 1;
+    } else if (eligibility === "ambiguous") {
+      counts.ambiguous += 1;
+    }
+  }
+
+  const ecommerceCost = Number(
+    settings.ecommerceShippingCost,
+  );
+  const posCost = Number(settings.posShippingCost);
+
+  return {
+    ...counts,
+    ecommerceCost,
+    posCost,
+    expense:
+      counts.ecommerceShipments * ecommerceCost +
+      counts.posShipments * posCost,
+  };
+}
+
+const RELEVANT_TRANSACTION_KINDS = new Set([
+  "SALE",
+  "CAPTURE",
+  "REFUND",
+]);
+
+const KNOWN_TRANSACTION_KINDS = new Set([
+  ...RELEVANT_TRANSACTION_KINDS,
+  "AUTHORIZATION",
+  "VOID",
+  "CHANGE",
+  "EMV_AUTHORIZATION",
+  "SUGGESTED_REFUND",
+]);
+
+const ZERO_FEE_GATEWAY_TERMS = [
+  "cash",
+  "gift card",
+  "store credit",
+  "manual",
+  "bank deposit",
+  "money order",
+  "cash on delivery",
+  "cod",
+  "complimentary",
+];
+
+function transactionAmount(transaction) {
+  return Number(
+    transaction.amountSet?.shopMoney?.amount || 0,
+  );
+}
+
+function signedTransactionAmount(transaction) {
+  const amount = transactionAmount(transaction);
+
+  return transaction.kind === "REFUND"
+    ? -Math.abs(amount)
+    : amount;
+}
+
+function actualTransactionFee(transaction) {
+  return (transaction.fees || []).reduce(
+    (total, fee) =>
+      total +
+      Number(fee.amount?.amount || 0) +
+      Number(fee.taxAmount?.amount || 0),
+    0,
+  );
+}
+
+function gatewayName(transaction) {
+  return transaction.formattedGateway?.trim() || "Unknown";
+}
+
+function isKnownZeroFeeMethod(transaction) {
+  if (transaction.manualPaymentGateway === true) return true;
+
+  const normalizedGateway = gatewayName(transaction).toLowerCase();
+
+  return ZERO_FEE_GATEWAY_TERMS.some((term) =>
+    normalizedGateway.includes(term),
+  );
+}
+
+function getProcessingAssumptions(channel, settings) {
+  if (channel === "pos") {
+    return {
+      percentage: Number(settings.posProcessingPercentage),
+      fixedFee: Number(settings.posProcessingFixedFee),
+    };
+  }
+
+  return {
+    percentage: Number(
+      settings.ecommerceProcessingPercentage,
+    ),
+    fixedFee: Number(settings.ecommerceProcessingFixedFee),
+  };
+}
+
+function addPaymentMethodCoverage(
+  paymentMethods,
+  order,
+  transaction,
+  actualFees = 0,
+  estimatedFees = 0,
+) {
+  const gateway = gatewayName(transaction);
+  const key = `${order.salesChannel}::${gateway}`;
+  const existing = paymentMethods.get(key) || {
+    gateway,
+    channel: order.salesChannel,
+    orderIds: new Set(),
+    salesAmount: 0,
+    actualFees: 0,
+    estimatedFees: 0,
+  };
+
+  existing.orderIds.add(order.id);
+  existing.salesAmount += signedTransactionAmount(transaction);
+  existing.actualFees += actualFees;
+  existing.estimatedFees += estimatedFees;
+  paymentMethods.set(key, existing);
+}
+
+function calculateProcessingFees(orders, settings) {
+  const paymentMethods = new Map();
+  const unexpectedKinds = new Set();
+  const unexpectedStatuses = new Set();
+  const ambiguousGateways = new Set();
+  let actualFees = 0;
+  let estimatedFees = 0;
+  let ordersWithActualFees = 0;
+  let ordersEstimated = 0;
+  let ordersExcluded = 0;
+  let ambiguousOrders = 0;
+  let ordersWithNoFeeData = 0;
+  let partialActualCoverageOrders = 0;
+
+  for (const order of orders) {
+    const transactions = order.transactions || [];
+
+    for (const transaction of transactions) {
+      if (!KNOWN_TRANSACTION_KINDS.has(transaction.kind)) {
+        unexpectedKinds.add(transaction.kind);
+      }
+
+      if (transaction.status !== "SUCCESS") {
+        unexpectedStatuses.add(
+          `${transaction.kind}:${transaction.status}`,
+        );
+      }
+    }
+
+    const relevantTransactions = transactions.filter(
+      (transaction) =>
+        !transaction.test &&
+        transaction.status === "SUCCESS" &&
+        RELEVANT_TRANSACTION_KINDS.has(transaction.kind),
+    );
+    const feeTransactions = relevantTransactions.filter(
+      (transaction) => transaction.fees?.length > 0,
+    );
+
+    if (feeTransactions.length > 0) {
+      ordersWithActualFees += 1;
+
+      if (feeTransactions.length < relevantTransactions.length) {
+        partialActualCoverageOrders += 1;
+      }
+
+      for (const transaction of relevantTransactions) {
+        const transactionFee = actualTransactionFee(transaction);
+
+        actualFees += transactionFee;
+        addPaymentMethodCoverage(
+          paymentMethods,
+          order,
+          transaction,
+          transactionFee,
+          0,
+        );
+      }
+
+      continue;
+    }
+
+    if (relevantTransactions.length > 0) {
+      ordersWithNoFeeData += 1;
+    }
+
+    const chargeTransactions = relevantTransactions.filter(
+      (transaction) =>
+        transaction.kind === "SALE" ||
+        transaction.kind === "CAPTURE",
+    );
+
+    if (chargeTransactions.length === 0) {
+      ambiguousOrders += 1;
+      ambiguousGateways.add(
+        transactions.length > 0
+          ? gatewayName(transactions[0])
+          : "No transaction data",
+      );
+      continue;
+    }
+
+    const zeroFeeTransactions = chargeTransactions.filter(
+      isKnownZeroFeeMethod,
+    );
+    const ambiguousTransactions = chargeTransactions.filter(
+      (transaction) =>
+        !isKnownZeroFeeMethod(transaction) &&
+        gatewayName(transaction) === "Unknown",
+    );
+
+    if (ambiguousTransactions.length > 0) {
+      ambiguousOrders += 1;
+
+      for (const transaction of ambiguousTransactions) {
+        ambiguousGateways.add(gatewayName(transaction));
+        addPaymentMethodCoverage(
+          paymentMethods,
+          order,
+          transaction,
+        );
+      }
+
+      continue;
+    }
+
+    if (zeroFeeTransactions.length === chargeTransactions.length) {
+      ordersExcluded += 1;
+
+      for (const transaction of zeroFeeTransactions) {
+        addPaymentMethodCoverage(
+          paymentMethods,
+          order,
+          transaction,
+        );
+      }
+
+      continue;
+    }
+
+    const estimableTransactions = chargeTransactions.filter(
+      (transaction) => !isKnownZeroFeeMethod(transaction),
+    );
+    const assumptions = getProcessingAssumptions(
+      order.salesChannel,
+      settings,
+    );
+    const percentageRate = assumptions.percentage / 100;
+    const percentageFees = estimableTransactions.reduce(
+      (total, transaction) =>
+        total + transactionAmount(transaction) * percentageRate,
+      0,
+    );
+    const orderEstimatedFees =
+      percentageFees + assumptions.fixedFee;
+
+    estimatedFees += orderEstimatedFees;
+    ordersEstimated += 1;
+
+    estimableTransactions.forEach((transaction, index) => {
+      const transactionEstimatedFee =
+        transactionAmount(transaction) * percentageRate +
+        (index === 0 ? assumptions.fixedFee : 0);
+
+      addPaymentMethodCoverage(
+        paymentMethods,
+        order,
+        transaction,
+        0,
+        transactionEstimatedFee,
+      );
+    });
+
+    for (const transaction of zeroFeeTransactions) {
+      addPaymentMethodCoverage(
+        paymentMethods,
+        order,
+        transaction,
+      );
+    }
+  }
+
+  return {
+    actualFees,
+    estimatedFees,
+    totalFees: actualFees + estimatedFees,
+    ordersWithActualFees,
+    ordersEstimated,
+    ordersExcluded,
+    ambiguousOrders,
+    ordersWithNoFeeData,
+    partialActualCoverageOrders,
+    unexpectedKinds: Array.from(unexpectedKinds).sort(),
+    unexpectedStatuses: Array.from(
+      unexpectedStatuses,
+    ).sort(),
+    ambiguousGateways: Array.from(ambiguousGateways).sort(),
+    paymentMethods: Array.from(paymentMethods.values())
+      .map((method) => ({
+        gateway: method.gateway,
+        channel: method.channel,
+        orderCount: method.orderIds.size,
+        salesAmount: method.salesAmount,
+        actualFees: method.actualFees,
+        estimatedFees: method.estimatedFees,
+      }))
+      .sort((left, right) =>
+        left.channel === right.channel
+          ? right.salesAmount - left.salesAmount
+          : left.channel.localeCompare(right.channel),
+      ),
+  };
+}
+
+function buildFinanceSummary(orders, productCosts, settings) {
+  const grossProductSales =
+    calculateGrossProductSales(orders);
+  const discounts = sumMoney(orders, "totalDiscountsSet");
+  const originalNetProductSales = sumMoney(
+    orders,
+    "subtotalPriceSet",
+  );
+  const currentNetProductSales = sumMoney(
+    orders,
+    "currentSubtotalPriceSet",
+  );
+  const profitSales = productCosts.isComplete
+    ? currentNetProductSales
+    : productCosts.knownCostSales;
+  const grossProfit = profitSales - productCosts.knownCogs;
+  const grossMargin =
+    profitSales > 0
+      ? (grossProfit / profitSales) * 100
+      : 0;
+  const estimatedShipping = calculateEstimatedShipping(
+    orders,
+    settings,
+  );
+  const processingFees = calculateProcessingFees(
+    orders,
+    settings,
+  );
+  const contributionProfit =
+    grossProfit -
+    estimatedShipping.expense -
+    processingFees.totalFees;
+  // Net product sales is the business-defined denominator for contribution
+  // margin, even when the contribution numerator is marked incomplete.
+  const contributionMargin =
+    currentNetProductSales > 0
+      ? (contributionProfit / currentNetProductSales) * 100
+      : 0;
+
+  const metrics = {
+    orders: orders.length,
+    unitsSold: countUnitsSold(orders),
+    grossProductSales,
+    discounts,
+    returnsAndEdits: Math.max(
+      0,
+      originalNetProductSales - currentNetProductSales,
+    ),
+    netProductSales: currentNetProductSales,
+    shippingCollected: sumMoney(
+      orders,
+      "currentShippingPriceSet",
+    ),
+    taxes: sumMoney(orders, "currentTotalTaxSet"),
+    totalSales: sumMoney(orders, "currentTotalPriceSet"),
+  };
+
+  metrics.averageOrderValue =
+    metrics.orders > 0
+      ? metrics.totalSales / metrics.orders
+      : 0;
+
+  return {
+    metrics,
+    profitability: {
+      ...productCosts,
+      grossProfit,
+      grossMargin,
+      estimatedShipping,
+      estimatedShippingExpense: estimatedShipping.expense,
+      processingFees,
+      contributionProfit,
+      contributionMargin,
+    },
+  };
+}
+export const action = async ({ request }) => {
+  const { admin, session } =
     await authenticate.admin(request);
+
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+
+  if (
+  intent !== "sync-products" &&
+  intent !== "sync-orders"
+) {
+  return {
+    success: false,
+    error: "Unknown finance action.",
+  };
+}
+  try {
+    if (intent === "sync-products") {
+  return {
+    syncType: "products",
+    ...(await syncProducts(
+      admin,
+      session.shop,
+    )),
+  };
+}
+
+return {
+  syncType: "orders",
+  ...(await syncOrders(
+    admin,
+    session.shop,
+  )),
+};
+  } catch (error) {
+    console.error("Product sync failed", error);
+
+    return {
+      success: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Product sync failed.",
+    };
+  }
+};
+export const loader = async ({ request }) => {
+const { admin, session } =
+  await authenticate.admin(request);
 
   const url = new URL(request.url);
 
@@ -102,80 +627,142 @@ export const loader = async ({ request }) => {
   )
     ? requestedPeriod
     : "today";
+  const savedSettings = serializeShopSettings(
+    await getOrCreateShopSettings(session.shop),
+  );
+  const requestedChannel = url.searchParams.get("channel");
+  const selectedChannel = isValidChannel(requestedChannel)
+    ? requestedChannel
+    : isValidChannel(savedSettings.defaultFinanceChannel)
+      ? savedSettings.defaultFinanceChannel
+      : "ecommerce";
 
   const financeData = await getFinanceSales(
     admin,
     selectedPeriod,
+    selectedChannel,
   );
+  const [
+  missingCostCount,
+  zeroCostCount,
+  rawCostIssues,
+] = await Promise.all([
+  prisma.variant.count({
+    where: {
+      shop: session.shop,
+      costStatus: "MISSING",
+    },
+  }),
+
+  prisma.variant.count({
+    where: {
+      shop: session.shop,
+      costStatus: "ZERO",
+    },
+  }),
+
+  prisma.variant.findMany({
+    where: {
+      shop: session.shop,
+      costStatus: {
+        in: ["MISSING", "ZERO"],
+      },
+    },
+
+    orderBy: [
+      {
+        costStatus: "asc",
+      },
+      {
+        updatedAt: "desc",
+      },
+    ],
+
+    take: 50,
+
+    select: {
+      id: true,
+      title: true,
+      sku: true,
+      price: true,
+      inventoryQuantity: true,
+      costStatus: true,
+
+      product: {
+        select: {
+          title: true,
+        },
+      },
+    },
+  }),
+]);
+
+const costIssues = rawCostIssues.map(
+  (variant) => ({
+    id: variant.id,
+    productTitle: variant.product.title,
+    variantTitle: variant.title,
+    sku: variant.sku,
+    price:
+      variant.price === null
+        ? null
+        : Number(variant.price),
+    inventoryQuantity:
+      variant.inventoryQuantity,
+    costStatus: variant.costStatus,
+  }),
+);
+
+const costIssueSummary = {
+  missing: missingCostCount,
+  zero: zeroCostCount,
+  total: missingCostCount + zeroCostCount,
+};
 
   const orders = financeData.orders;
+  const { metrics, profitability } =
+    buildFinanceSummary(
+      orders,
+      financeData.productCosts,
+      savedSettings,
+    );
+  const channelBreakdown =
+    selectedChannel === "all"
+      ? {
+          ecommerce: buildFinanceSummary(
+            financeData.allOrders.filter(
+              (order) =>
+                order.salesChannel === "ecommerce",
+            ),
+            financeData.productCostsByChannel.ecommerce,
+            savedSettings,
+          ),
+          pos: buildFinanceSummary(
+            financeData.allOrders.filter(
+              (order) => order.salesChannel === "pos",
+            ),
+            financeData.productCostsByChannel.pos,
+            savedSettings,
+          ),
+        }
+      : null;
 
-  const grossProductSales =
-    calculateGrossProductSales(orders);
-
-  const discounts = sumMoney(
-    orders,
-    "totalDiscountsSet",
-  );
-
-  const originalNetProductSales = sumMoney(
-    orders,
-    "subtotalPriceSet",
-  );
-
-  const currentNetProductSales = sumMoney(
-    orders,
-    "currentSubtotalPriceSet",
-  );
-
-  const returnsAndEdits = Math.max(
-    0,
-    originalNetProductSales -
-      currentNetProductSales,
-  );
-
-  const shippingCollected = sumMoney(
-    orders,
-    "currentShippingPriceSet",
-  );
-
-  const taxes = sumMoney(
-    orders,
-    "currentTotalTaxSet",
-  );
-
-  const totalSales = sumMoney(
-    orders,
-    "currentTotalPriceSet",
-  );
-
-  const metrics = {
-    orders: orders.length,
-    unitsSold: countUnitsSold(orders),
-
-    grossProductSales,
-    discounts,
-    returnsAndEdits,
-    netProductSales: currentNetProductSales,
-
-    shippingCollected,
-    taxes,
-    totalSales,
-  };
-
-  metrics.averageOrderValue =
-    metrics.orders > 0
-      ? metrics.totalSales / metrics.orders
-      : 0;
-
-  return {
-    selectedPeriod,
-    period: financeData.period,
-    timezone: financeData.timezone,
-    currencyCode: financeData.currencyCode,
-    metrics,
-    orders,
-  };
+return {
+  selectedPeriod,
+  selectedChannel,
+  channelContext: CHANNEL_CONTEXT[selectedChannel],
+  period: financeData.period,
+  timezone: financeData.timezone,
+  currencyCode: financeData.currencyCode,
+  metrics,
+  orders,
+  costIssues,
+  costIssueSummary,
+  profitability,
+  channelBreakdown,
+  unexpectedSourceNames:
+    financeData.unexpectedSourceNames,
+};
 };
 
 function MetricCard({
@@ -203,6 +790,17 @@ function MetricCard({
     </s-box>
   );
 }
+
+MetricCard.propTypes = {
+  label: PropTypes.string.isRequired,
+  value: PropTypes.oneOfType([
+    PropTypes.number,
+    PropTypes.string,
+  ]).isRequired,
+  description: PropTypes.string.isRequired,
+  currencyCode: PropTypes.string.isRequired,
+  isMoney: PropTypes.bool,
+};
 
 function WaterfallRow({
   label,
@@ -234,18 +832,202 @@ function WaterfallRow({
   );
 }
 
-export default function FinanceDashboard() {
-  const {
-    selectedPeriod,
-    period,
-    timezone,
-    currencyCode,
-    metrics,
-    orders,
-  } = useLoaderData();
+WaterfallRow.propTypes = {
+  label: PropTypes.string.isRequired,
+  value: PropTypes.oneOfType([
+    PropTypes.number,
+    PropTypes.string,
+  ]).isRequired,
+  currencyCode: PropTypes.string.isRequired,
+  prefix: PropTypes.string,
+  strong: PropTypes.bool,
+};
+
+export default function FinanceDashboard() {  const actionData = useActionData();
+  const navigation = useNavigation();
+
+  const activeIntent =
+  navigation.formData?.get("intent");
+
+const isSyncingProducts =
+  navigation.state === "submitting" &&
+  activeIntent === "sync-products";
+
+const isSyncingOrders =
+  navigation.state === "submitting" &&
+  activeIntent === "sync-orders";
+
+ const {
+  selectedPeriod,
+  selectedChannel,
+  channelContext,
+  period,
+  timezone,
+  currencyCode,
+  metrics,
+  orders,
+  costIssues,
+  costIssueSummary,
+  profitability,
+  channelBreakdown,
+  unexpectedSourceNames,
+} = useLoaderData();
 
   return (
     <s-page heading="Finance">
+              <s-section heading="Catalog Sync">
+        <s-stack direction="block" gap="base">
+          <s-paragraph>
+            Import Shopify products, variants,
+            inventory quantities, and product costs
+            into the local finance database.
+          </s-paragraph>
+
+<Form method="post">
+  <input
+    type="hidden"
+    name="intent"
+    value="sync-products"
+  />
+
+  <button
+    type="submit"
+    disabled={
+      isSyncingProducts || isSyncingOrders
+    }
+    style={{
+      padding: "10px 16px",
+      borderRadius: "8px",
+      border: "none",
+      background: "#202223",
+      color: "#ffffff",
+      fontWeight: 600,
+      cursor:
+        isSyncingProducts || isSyncingOrders
+          ? "not-allowed"
+          : "pointer",
+      opacity:
+        isSyncingProducts || isSyncingOrders
+          ? 0.6
+          : 1,
+    }}
+  >
+    {isSyncingProducts
+      ? "Syncing Products..."
+      : "Sync Products"}
+  </button>
+</Form>
+
+<Form method="post">
+  <input
+    type="hidden"
+    name="intent"
+    value="sync-orders"
+  />
+
+  <button
+    type="submit"
+    disabled={
+      isSyncingProducts || isSyncingOrders
+    }
+    style={{
+      padding: "10px 16px",
+      borderRadius: "8px",
+      border: "1px solid #202223",
+      background: "#ffffff",
+      color: "#202223",
+      fontWeight: 600,
+      cursor:
+        isSyncingProducts || isSyncingOrders
+          ? "not-allowed"
+          : "pointer",
+      opacity:
+        isSyncingProducts || isSyncingOrders
+          ? 0.6
+          : 1,
+    }}
+  >
+    {isSyncingOrders
+      ? "Syncing Orders..."
+      : "Sync Orders"}
+  </button>
+</Form>
+
+{actionData?.success &&
+actionData.syncType === "products" ? (
+  <s-box
+    padding="base"
+    borderWidth="base"
+    borderRadius="base"
+  >
+    <s-paragraph>
+      Product sync completed.
+    </s-paragraph>
+
+    <s-paragraph>
+      Products: {actionData.syncedProducts}
+    </s-paragraph>
+
+    <s-paragraph>
+      Variants: {actionData.syncedVariants}
+    </s-paragraph>
+
+    <s-paragraph>
+      Valid costs: {actionData.validCostVariants}
+    </s-paragraph>
+
+    <s-paragraph>
+      Missing costs: {actionData.missingCostVariants}
+    </s-paragraph>
+
+    <s-paragraph>
+      Zero costs: {actionData.zeroCostVariants}
+    </s-paragraph>
+  </s-box>
+) : null}
+
+{actionData?.success &&
+actionData.syncType === "orders" ? (
+  <s-box
+    padding="base"
+    borderWidth="base"
+    borderRadius="base"
+  >
+    <s-paragraph>
+      Order sync completed.
+    </s-paragraph>
+
+    <s-paragraph>
+      Orders: {actionData.syncedOrders}
+    </s-paragraph>
+
+    <s-paragraph>
+      Order lines: {actionData.syncedOrderLines}
+    </s-paragraph>
+
+    <s-paragraph>
+      Complete COGS orders: {actionData.completeCogsOrders}
+    </s-paragraph>
+
+    <s-paragraph>
+      Incomplete COGS orders: {actionData.incompleteCogsOrders}
+    </s-paragraph>
+  </s-box>
+) : null}
+
+{actionData?.error ? (
+  <s-box
+    padding="base"
+    borderWidth="base"
+    borderRadius="base"
+  >
+    <s-paragraph>
+      ⚠ {actionData.error}
+    </s-paragraph>
+  </s-box>
+) : null}
+        </s-stack>
+      </s-section>
       <s-section heading="Performance Period">
         <div
           style={{
@@ -262,7 +1044,12 @@ export default function FinanceDashboard() {
             return (
               <Link
                 key={option.key}
-                to={`/app/finance?period=${option.key}`}
+                to={
+                  "/app/finance?period=" +
+                  option.key +
+                  "&channel=" +
+                  selectedChannel
+                }
                 style={{
                   display: "inline-block",
                   padding: "8px 14px",
@@ -289,7 +1076,59 @@ export default function FinanceDashboard() {
         </div>
 
         <s-paragraph>
+          <strong>Sales Channel</strong>
+        </s-paragraph>
+
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "8px",
+            margin: "8px 0 16px",
+          }}
+        >
+          {CHANNEL_OPTIONS.map((option) => {
+            const isSelected =
+              selectedChannel === option.key;
+
+            return (
+              <Link
+                key={option.key}
+                to={
+                  "/app/finance?period=" +
+                  selectedPeriod +
+                  "&channel=" +
+                  option.key
+                }
+                style={{
+                  display: "inline-block",
+                  padding: "8px 14px",
+                  borderRadius: "8px",
+                  border: isSelected
+                    ? "1px solid #202223"
+                    : "1px solid #c9cccf",
+                  background: isSelected
+                    ? "#202223"
+                    : "#ffffff",
+                  color: isSelected
+                    ? "#ffffff"
+                    : "#202223",
+                  textDecoration: "none",
+                  fontWeight: isSelected ? 600 : 400,
+                }}
+              >
+                {option.label}
+              </Link>
+            );
+          })}
+        </div>
+
+        <s-paragraph>
           {period.label}
+        </s-paragraph>
+
+        <s-paragraph>
+          Active channel: <strong>{channelContext}</strong>
         </s-paragraph>
 
         <s-paragraph>
@@ -379,6 +1218,89 @@ export default function FinanceDashboard() {
           currencyCode={currencyCode}
         />
       </div>
+
+      {channelBreakdown ? (
+        <s-section heading="Ecommerce versus POS">
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns:
+                "repeat(auto-fit, minmax(280px, 1fr))",
+              gap: "16px",
+            }}
+          >
+            {[
+              ["Ecommerce", channelBreakdown.ecommerce],
+              ["POS", channelBreakdown.pos],
+            ].map(([label, summary]) => (
+              <s-box
+                key={label}
+                padding="base"
+                borderWidth="base"
+                borderRadius="base"
+              >
+                <s-heading>{label}</s-heading>
+                <s-paragraph>
+                  Sales:{" "}
+                  {money(
+                    summary.metrics.totalSales,
+                    currencyCode,
+                  )}
+                </s-paragraph>
+                <s-paragraph>
+                  Orders: {summary.metrics.orders}
+                </s-paragraph>
+                <s-paragraph>
+                  Units: {summary.metrics.unitsSold}
+                </s-paragraph>
+                <s-paragraph>
+                  COGS:{" "}
+                  {money(
+                    summary.profitability.knownCogs,
+                    currencyCode,
+                  )}
+                </s-paragraph>
+                <s-paragraph>
+                  Gross profit:{" "}
+                  {money(
+                    summary.profitability.grossProfit,
+                    currencyCode,
+                  )}
+                </s-paragraph>
+                <s-paragraph>
+                  Estimated shipping:{" "}
+                  {money(
+                    summary.profitability
+                      .estimatedShippingExpense,
+                    currencyCode,
+                  )}
+                </s-paragraph>
+                <s-paragraph>
+                  Processing fees:{" "}
+                  {money(
+                    summary.profitability.processingFees
+                      .totalFees,
+                    currencyCode,
+                  )}{" "}
+                  (
+                  {money(
+                    summary.profitability.processingFees
+                      .actualFees,
+                    currencyCode,
+                  )}{" "}
+                  actual,{" "}
+                  {money(
+                    summary.profitability.processingFees
+                      .estimatedFees,
+                    currencyCode,
+                  )}{" "}
+                  estimated)
+                </s-paragraph>
+              </s-box>
+            ))}
+          </div>
+        </s-section>
+      ) : null}
 
       <s-section heading="Sales Breakdown">
         <s-box
@@ -488,6 +1410,18 @@ export default function FinanceDashboard() {
                     }
                   </s-paragraph>
 
+                  <s-paragraph>
+                    Channel: {order.salesChannel === "pos"
+                      ? "POS"
+                      : "Ecommerce"}{" "}
+                    · Shopify source:{" "}
+                    {order.rawSourceName || "Not provided"}
+                    {order.retailLocation?.name
+                      ? " · Location: " +
+                        order.retailLocation.name
+                      : ""}
+                  </s-paragraph>
+
                   {order.cancelledAt ? (
                     <s-paragraph>
                       ⚠ This order was cancelled.
@@ -532,22 +1466,751 @@ export default function FinanceDashboard() {
           </s-paragraph>
 
           <s-paragraph>
-            ⚠ Product COGS has not been calculated.
+            ✅ Product COGS uses each sold variant&apos;s
+            current Shopify inventory item unit cost.
           </s-paragraph>
 
           <s-paragraph>
-            ⚠ Outbound shipping expense and payment
-            fees are still missing.
+            ✅ Processing fees use Shopify transaction
+            fee data when available and labeled fallback
+            estimates otherwise.
           </s-paragraph>
 
           <s-paragraph>
             ⚠ Meta advertising spend has not been
             connected.
           </s-paragraph>
+
+          {profitability.processingFees
+            .ordersWithNoFeeData > 0 ? (
+            <s-paragraph>
+              ⚠{" "}
+              {
+                profitability.processingFees
+                  .ordersWithNoFeeData
+              }{" "}
+              included order
+              {profitability.processingFees
+                .ordersWithNoFeeData === 1
+                ? ""
+                : "s"}{" "}
+              had successful payment transactions but no
+              Shopify transaction fee records.
+            </s-paragraph>
+          ) : null}
+
+          {profitability.processingFees.unexpectedKinds
+            .length > 0 ? (
+            <s-paragraph>
+              ⚠ Unexpected transaction kinds:{" "}
+              {profitability.processingFees.unexpectedKinds.join(
+                ", ",
+              )}
+              .
+            </s-paragraph>
+          ) : null}
+
+          {profitability.processingFees
+            .unexpectedStatuses.length > 0 ? (
+            <s-paragraph>
+              ⚠ Non-success transaction statuses excluded
+              from fee calculations:{" "}
+              {profitability.processingFees.unexpectedStatuses.join(
+                ", ",
+              )}
+              .
+            </s-paragraph>
+          ) : null}
+
+          {profitability.processingFees.ambiguousGateways
+            .length > 0 ? (
+            <s-paragraph>
+              ⚠ Unsupported or ambiguous payment
+              gateways requiring review:{" "}
+              {profitability.processingFees.ambiguousGateways.join(
+                ", ",
+              )}
+              .
+            </s-paragraph>
+          ) : null}
+
+          {profitability.processingFees
+            .ordersWithActualFees > 0 &&
+          profitability.processingFees.ordersEstimated >
+            0 ? (
+            <s-paragraph>
+              ⚠ This selection contains mixed actual and
+              estimated processing-fee coverage.
+            </s-paragraph>
+          ) : null}
+
+          {profitability.processingFees
+            .partialActualCoverageOrders > 0 ? (
+            <s-paragraph>
+              ⚠{" "}
+              {
+                profitability.processingFees
+                  .partialActualCoverageOrders
+              }{" "}
+              order
+              {profitability.processingFees
+                .partialActualCoverageOrders === 1
+                ? ""
+                : "s"}{" "}
+              had actual fees on only some qualifying
+              transactions; no fallback was added.
+            </s-paragraph>
+          ) : null}
+
+          {unexpectedSourceNames.length > 0 ? (
+            <s-paragraph>
+              ⚠ Nonstandard Shopify order source
+              {unexpectedSourceNames.length === 1
+                ? ""
+                : "s"}{" "}
+              classified as Ecommerce:{" "}
+              {unexpectedSourceNames.join(", ")}.
+            </s-paragraph>
+          ) : (
+            <s-paragraph>
+              ✅ No nonstandard Shopify order source names
+              were found for this reporting period.
+            </s-paragraph>
+          )}
         </s-stack>
       </s-section>
+<s-section heading="Product Cost Health">
+  {costIssueSummary.total > 0 ? (
+    <s-stack direction="block" gap="base">
+      <s-box
+        padding="base"
+        borderWidth="base"
+        borderRadius="base"
+      >
+        <s-heading>
+          ⚠ {costIssueSummary.total} variant
+          {costIssueSummary.total === 1
+            ? ""
+            : "s"}{" "}
+          {costIssueSummary.total === 1
+            ? "needs"
+            : "need"}{" "}
+          cost attention
+        </s-heading>
+
+        <s-paragraph>
+          Missing costs:{" "}
+          {costIssueSummary.missing}
+        </s-paragraph>
+
+        <s-paragraph>
+          Zero costs: {costIssueSummary.zero}
+        </s-paragraph>
+
+        {costIssueSummary.missing > 0 ? (
+          <s-paragraph>
+            Profit is incomplete when sold variants do
+            not have Shopify cost data.
+          </s-paragraph>
+        ) : null}
+
+        {costIssueSummary.zero > 0 ? (
+          <s-paragraph>
+            Profit may be overstated when sold variants
+            have a $0 Shopify cost.
+          </s-paragraph>
+        ) : null}
+      </s-box>
+
+      {costIssues.map((variant) => (
+        <s-box
+          key={variant.id}
+          padding="base"
+          borderWidth="base"
+          borderRadius="base"
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: "20px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <s-paragraph>
+                <strong>
+                  {variant.productTitle}
+                </strong>
+              </s-paragraph>
+
+              <s-paragraph>
+                Variant: {variant.variantTitle}
+              </s-paragraph>
+
+              <s-paragraph>
+                SKU: {variant.sku || "No SKU"}
+              </s-paragraph>
+            </div>
+
+            <div>
+              <s-paragraph>
+                Price:{" "}
+                {variant.price === null
+                  ? "Not available"
+                  : money(
+                      variant.price,
+                      currencyCode,
+                    )}
+              </s-paragraph>
+
+              <s-paragraph>
+                Inventory:{" "}
+                {variant.inventoryQuantity ??
+                  "Not tracked"}
+              </s-paragraph>
+
+              <s-paragraph>
+                Status:{" "}
+                <strong>
+                  {variant.costStatus}
+                </strong>
+              </s-paragraph>
+            </div>
+          </div>
+        </s-box>
+      ))}
+
+      {costIssueSummary.total >
+      costIssues.length ? (
+        <s-paragraph>
+          Showing the first {costIssues.length} cost
+          issues.
+        </s-paragraph>
+      ) : null}
+    </s-stack>
+  ) : (
+    <s-box
+      padding="base"
+      borderWidth="base"
+      borderRadius="base"
+    >
+      <s-paragraph>
+        ✅ Every synced variant has a valid Shopify
+        cost.
+      </s-paragraph>
+    </s-box>
+  )}
+</s-section>
+<s-section heading="Sold Item Cost Warnings">
+  {profitability.missingCostItems.length > 0 ||
+  profitability.zeroCostVariantCount > 0 ? (
+    <s-stack direction="block" gap="base">
+      <s-box
+        padding="base"
+        borderWidth="base"
+        borderRadius="base"
+      >
+        <s-heading>
+          ⚠ Sold item cost attention required
+        </s-heading>
+
+        <s-paragraph>
+          Missing costs:{" "}
+          {profitability.missingCostItems.length} sold{" "}
+          {profitability.missingCostItems.length === 1
+            ? "variant"
+            : "variants"}
+        </s-paragraph>
+
+        <s-paragraph>
+          Zero costs:{" "}
+          {profitability.zeroCostVariantCount} sold{" "}
+          {profitability.zeroCostVariantCount === 1
+            ? "variant"
+            : "variants"}
+        </s-paragraph>
+
+        {profitability.missingCostItems.length > 0 ? (
+          <s-paragraph>
+            Profit is incomplete because cost data is
+            unavailable for{" "}
+            {profitability.missingCostItems.length} sold{" "}
+            {profitability.missingCostItems.length === 1
+              ? "variant"
+              : "variants"}.{" "}
+            {money(
+              profitability.missingCostSales,
+              currencyCode,
+            )}{" "}
+            in product sales is tied to missing-cost
+            items. Missing costs are excluded from profit
+            and margin, not treated as zero.
+          </s-paragraph>
+        ) : null}
+
+        {profitability.zeroCostVariantCount > 0 ? (
+          <s-paragraph>
+            Profit may be overstated because{" "}
+            {profitability.zeroCostVariantCount} sold{" "}
+            {profitability.zeroCostVariantCount === 1
+              ? "variant has"
+              : "variants have"}{" "}
+            a $0 Shopify cost.
+          </s-paragraph>
+        ) : null}
+      </s-box>
+
+      {profitability.missingCostItems.map((item) => (
+        <s-box
+          key={item.id}
+          padding="base"
+          borderWidth="base"
+          borderRadius="base"
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "flex-start",
+              gap: "20px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <s-paragraph>
+                <strong>{item.productName}</strong>
+              </s-paragraph>
+              <s-paragraph>
+                Variant: {item.variantName}
+              </s-paragraph>
+              <s-paragraph>
+                SKU: {item.sku || "No SKU"}
+              </s-paragraph>
+            </div>
+
+            <div>
+              <s-paragraph>
+                Quantity sold: {item.quantity}
+              </s-paragraph>
+              <s-paragraph>
+                Sales:{" "}
+                {money(item.salesAmount, currencyCode)}
+              </s-paragraph>
+            </div>
+          </div>
+        </s-box>
+      ))}
+    </s-stack>
+  ) : (
+    <s-box
+      padding="base"
+      borderWidth="base"
+      borderRadius="base"
+    >
+      <s-paragraph>
+        ✅ Every sold variant in this period has a
+        Shopify inventory item cost.
+      </s-paragraph>
+    </s-box>
+  )}
+</s-section>
+
+<s-section heading="Profitability">
+  {orders.length === 0 ? (
+    <s-box
+      padding="base"
+      borderWidth="base"
+      borderRadius="base"
+    >
+      <s-paragraph>
+        No sold items were found for this period.
+      </s-paragraph>
+    </s-box>
+  ) : (
+    <s-stack direction="block" gap="base">
+      {!profitability.isComplete ? (
+        <s-box
+          padding="base"
+          borderWidth="base"
+          borderRadius="base"
+        >
+          <s-heading>
+            ⚠ Profit reporting is incomplete
+          </s-heading>
+
+          <s-paragraph>
+            Profit and margin include only sales from
+            items with known costs. Missing costs are not
+            treated as zero.
+          </s-paragraph>
+        </s-box>
+      ) : (
+        <s-box
+          padding="base"
+          borderWidth="base"
+          borderRadius="base"
+        >
+          <s-paragraph>
+            ✅ Every sold variant in this period has
+            Shopify cost data.
+          </s-paragraph>
+        </s-box>
+      )}
+
+      {profitability.processingFees.ordersEstimated > 0 ||
+      profitability.processingFees.ambiguousOrders > 0 ||
+      profitability.processingFees
+        .partialActualCoverageOrders > 0 ? (
+        <s-box
+          padding="base"
+          borderWidth="base"
+          borderRadius="base"
+        >
+          <s-heading>
+            ⚠ Processing-fee coverage is not fully actual
+          </s-heading>
+          {profitability.processingFees.ordersEstimated >
+          0 ? (
+            <s-paragraph>
+              Contribution includes clearly labeled
+              fallback estimates for{" "}
+              {
+                profitability.processingFees
+                  .ordersEstimated
+              }{" "}
+              order
+              {profitability.processingFees
+                .ordersEstimated === 1
+                ? ""
+                : "s"}.
+            </s-paragraph>
+          ) : null}
+          {profitability.processingFees.ambiguousOrders >
+          0 ? (
+            <s-paragraph>
+              {
+                profitability.processingFees
+                  .ambiguousOrders
+              }{" "}
+              ambiguous order
+              {profitability.processingFees
+                .ambiguousOrders === 1
+                ? ""
+                : "s"}{" "}
+              received no processing-fee estimate, so
+              contribution may be overstated.
+            </s-paragraph>
+          ) : null}
+          {profitability.processingFees
+            .partialActualCoverageOrders > 0 ? (
+            <s-paragraph>
+              Some orders have actual fees on only part
+              of their qualifying transaction activity;
+              no fallback was layered onto those orders.
+            </s-paragraph>
+          ) : null}
+        </s-box>
+      ) : null}
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns:
+            "repeat(auto-fit, minmax(220px, 1fr))",
+          gap: "16px",
+        }}
+      >
+        <MetricCard
+          label={
+            profitability.isComplete
+              ? "Product COGS"
+              : "Known Product COGS"
+          }
+          value={profitability.knownCogs}
+          description={
+            profitability.isComplete
+              ? "Shopify unit cost × current quantity"
+              : "Only sold units with a Shopify cost"
+          }
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label={
+            profitability.isComplete
+              ? "Gross Profit Before Shipping, Payment Fees, and Ads"
+              : "Known Gross Profit Before Shipping, Payment Fees, and Ads"
+          }
+          value={profitability.grossProfit}
+          description={
+            profitability.isComplete
+              ? "Net product sales minus product COGS"
+              : "Known-cost item sales minus known product COGS"
+          }
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Gross Margin Percentage"
+          value={`${profitability.grossMargin.toFixed(
+            1,
+          )}%`}
+          description={
+            profitability.isComplete
+              ? "Gross profit divided by net product sales"
+              : "Based only on sold items with known costs"
+          }
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Estimated Shipping Expense"
+          value={profitability.estimatedShippingExpense}
+          description={[
+            profitability.estimatedShipping
+              .ecommerceShipments,
+            " ecommerce × ",
+            money(
+              profitability.estimatedShipping
+                .ecommerceCost,
+              currencyCode,
+            ),
+            " + ",
+            profitability.estimatedShipping.posShipments,
+            " shipped POS × ",
+            money(
+              profitability.estimatedShipping.posCost,
+              currencyCode,
+            ),
+          ].join("")}
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Actual Processing Fees"
+          value={profitability.processingFees.actualFees}
+          description="Shopify transaction fees plus fee tax"
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Estimated Processing Fees"
+          value={profitability.processingFees.estimatedFees}
+          description="Fallback assumptions; never presented as actual"
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Total Processing Fees"
+          value={profitability.processingFees.totalFees}
+          description="Actual fees plus clearly identified estimates"
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Orders with Actual Fees"
+          value={
+            profitability.processingFees
+              .ordersWithActualFees
+          }
+          description="Orders using Shopify transaction fee records"
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Orders Estimated"
+          value={
+            profitability.processingFees.ordersEstimated
+          }
+          description="Orders using channel-specific fallback assumptions"
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Known Zero-Fee / Manual Orders"
+          value={
+            profitability.processingFees.ordersExcluded
+          }
+          description="Manual or identified non-card payments"
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Ambiguous Orders Requiring Review"
+          value={
+            profitability.processingFees.ambiguousOrders
+          }
+          description="No estimate applied"
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label={
+            profitability.isComplete
+              ? "Contribution Profit"
+              : "Known Contribution Profit"
+          }
+          value={profitability.contributionProfit}
+          description="Net product sales minus COGS, estimated shipping, and total processing fees"
+          currencyCode={currencyCode}
+        />
+
+        <MetricCard
+          label="Contribution Margin %"
+          value={
+            profitability.contributionMargin.toFixed(1) +
+            "%"
+          }
+          description={
+            profitability.isComplete
+              ? "Contribution profit divided by net product sales"
+              : "Incomplete contribution divided by net product sales"
+          }
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Units Missing Cost"
+          value={profitability.unitsMissingCost}
+          description="Sold units without a Shopify cost"
+          currencyCode={currencyCode}
+          isMoney={false}
+        />
+
+        <MetricCard
+          label="Sales Tied to Missing-Cost Items"
+          value={profitability.missingCostSales}
+          description="Sales excluded from incomplete profit figures"
+          currencyCode={currencyCode}
+        />
+      </div>
+    </s-stack>
+  )}
+</s-section>
+
+<s-section heading="Payment Methods and Gateways">
+  {profitability.processingFees.paymentMethods.length > 0 ? (
+    <s-stack direction="block" gap="base">
+      {profitability.processingFees.ordersWithActualFees >
+        0 &&
+      profitability.processingFees.ordersEstimated > 0 ? (
+        <s-paragraph>
+          ⚠ This period contains mixed actual and
+          estimated processing-fee coverage.
+        </s-paragraph>
+      ) : null}
+
+      {profitability.processingFees.paymentMethods.map(
+        (method) => (
+          <s-box
+            key={method.channel + "::" + method.gateway}
+            padding="base"
+            borderWidth="base"
+            borderRadius="base"
+          >
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns:
+                  "repeat(auto-fit, minmax(150px, 1fr))",
+                gap: "12px",
+              }}
+            >
+              <s-paragraph>
+                <strong>{method.gateway}</strong>
+              </s-paragraph>
+              <s-paragraph>
+                Channel:{" "}
+                {method.channel === "pos"
+                  ? "POS"
+                  : "Ecommerce"}
+              </s-paragraph>
+              <s-paragraph>
+                Orders: {method.orderCount}
+              </s-paragraph>
+              <s-paragraph>
+                Sales:{" "}
+                {money(method.salesAmount, currencyCode)}
+              </s-paragraph>
+              <s-paragraph>
+                Actual fees:{" "}
+                {money(method.actualFees, currencyCode)}
+              </s-paragraph>
+              <s-paragraph>
+                Estimated fees:{" "}
+                {money(method.estimatedFees, currencyCode)}
+              </s-paragraph>
+            </div>
+          </s-box>
+        ),
+      )}
+    </s-stack>
+  ) : (
+    <s-paragraph>
+      No successful payment transactions were available
+      for this selection.
+    </s-paragraph>
+  )}
+</s-section>
+
+<s-section heading="Estimated Shipping Eligibility">
+  <div
+    style={{
+      display: "grid",
+      gridTemplateColumns:
+        "repeat(auto-fit, minmax(220px, 1fr))",
+      gap: "16px",
+    }}
+  >
+    <MetricCard
+      label="Ecommerce Orders Charged"
+      value={
+        profitability.estimatedShipping
+          .ecommerceShipments
+      }
+      description="Eligible ecommerce shipments"
+      currencyCode={currencyCode}
+      isMoney={false}
+    />
+    <MetricCard
+      label="POS Orders Charged"
+      value={
+        profitability.estimatedShipping.posShipments
+      }
+      description="POS orders reliably identified as shipped"
+      currencyCode={currencyCode}
+      isMoney={false}
+    />
+    <MetricCard
+      label="POS Walk-Out Orders Excluded"
+      value={
+        profitability.estimatedShipping.posWalkouts
+      }
+      description="Ordinary POS orders not charged shipping"
+      currencyCode={currencyCode}
+      isMoney={false}
+    />
+    <MetricCard
+      label="Ambiguous Orders Not Charged"
+      value={profitability.estimatedShipping.ambiguous}
+      description="Shipping status requires review"
+      currencyCode={currencyCode}
+      isMoney={false}
+    />
+  </div>
+</s-section>
+
     </s-page>
   );
+
 }
 
 export function ErrorBoundary() {
