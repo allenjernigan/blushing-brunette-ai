@@ -223,6 +223,167 @@ function getPeriodRange(periodKey, timezone) {
   }
 }
 
+const SHOPIFYQL_SALES_METRICS = [
+  "gross_sales",
+  "discounts",
+  "sales_reversals",
+  "net_sales",
+  "shipping_charges",
+  "taxes",
+  "total_sales",
+  "orders",
+  "average_order_value",
+];
+
+function buildShopifyqlSalesQuery(
+  period,
+  timezone,
+  groupByPos,
+) {
+  const startDate = DateTime.fromISO(period.start)
+    .setZone(timezone)
+    .toFormat("yyyy-MM-dd");
+  const endDate = DateTime.fromISO(period.end)
+    .minus({ milliseconds: 1 })
+    .setZone(timezone)
+    .toFormat("yyyy-MM-dd");
+  const grouping = groupByPos
+    ? "\n    GROUP BY is_pos_sale"
+    : "";
+
+  return `FROM sales
+    SHOW ${SHOPIFYQL_SALES_METRICS.join(", ")}${grouping}
+    SINCE ${startDate} UNTIL ${endDate}`;
+}
+
+function isPosSalesRow(row) {
+  return (
+    row.is_pos_sale === true ||
+    row.is_pos_sale === "true"
+  );
+}
+
+function normalizeShopifyqlSales(row = {}) {
+  return {
+    grossProductSales: Number(row.gross_sales || 0),
+    discounts: Number(row.discounts || 0),
+    returnsAndEdits: Number(
+      row.sales_reversals || 0,
+    ),
+    netProductSales: Number(row.net_sales || 0),
+    shippingCollected: Number(
+      row.shipping_charges || 0,
+    ),
+    taxes: Number(row.taxes || 0),
+    totalSales: Number(row.total_sales || 0),
+    orders: Number(row.orders || 0),
+    averageOrderValue: Number(
+      row.average_order_value || 0,
+    ),
+  };
+}
+
+async function runShopifyqlSalesQuery(
+  admin,
+  query,
+  operationName,
+) {
+  const response = await admin.graphql(
+    `#graphql
+      query FinanceShopifyqlSales($query: String!) {
+        shopifyqlQuery(query: $query) {
+          parseErrors
+          tableData {
+            rows
+          }
+        }
+      }
+    `,
+    {
+      variables: { query },
+    },
+  );
+
+  const json = await response.json();
+
+  if (json.errors?.length) {
+    throw new Error(
+      `${operationName} failed: ${json.errors
+        .map((error) => error.message)
+        .join(", ")}`,
+    );
+  }
+
+  const result = json.data?.shopifyqlQuery;
+
+  if (!result) {
+    throw new Error(
+      `${operationName} returned no ShopifyQL result.`,
+    );
+  }
+
+  if (result.parseErrors?.length) {
+    throw new Error(
+      `${operationName} parse errors: ${result.parseErrors.join(
+        ", ",
+      )}`,
+    );
+  }
+
+  if (!result.tableData) {
+    throw new Error(
+      `${operationName} returned no table data.`,
+    );
+  }
+
+  return result.tableData.rows || [];
+}
+
+async function getShopifyqlSalesTotals(
+  admin,
+  period,
+  timezone,
+) {
+  const [groupedRows, allRows] = await Promise.all([
+    runShopifyqlSalesQuery(
+      admin,
+      buildShopifyqlSalesQuery(
+        period,
+        timezone,
+        true,
+      ),
+      "Grouped Finance ShopifyQL query",
+    ),
+    runShopifyqlSalesQuery(
+      admin,
+      buildShopifyqlSalesQuery(
+        period,
+        timezone,
+        false,
+      ),
+      "All-channel Finance ShopifyQL query",
+    ),
+  ]);
+
+  const ecommerceRow = groupedRows.find(
+    (row) => !isPosSalesRow(row),
+  );
+  const posRow = groupedRows.find(isPosSalesRow);
+  const allRow = allRows[0];
+
+  if (!allRow) {
+    throw new Error(
+      "All-channel Finance ShopifyQL query returned no totals row.",
+    );
+  }
+
+  return {
+    all: normalizeShopifyqlSales(allRow),
+    ecommerce: normalizeShopifyqlSales(ecommerceRow),
+    pos: normalizeShopifyqlSales(posRow),
+  };
+}
+
 async function getOrdersForRange(admin, start, end) {
   const orders = [];
   let hasNextPage = true;
@@ -555,13 +716,22 @@ export async function getFinanceSales(
     shop.timezone,
   );
 
-  const allOrders = (
-    await getOrdersForRange(
-    admin,
-    period.start,
-    period.end,
-    )
-  ).map(withChannelClassification);
+  const [loadedOrders, shopifyqlSales] =
+    await Promise.all([
+      getOrdersForRange(
+        admin,
+        period.start,
+        period.end,
+      ),
+      getShopifyqlSalesTotals(
+        admin,
+        period,
+        shop.timezone,
+      ),
+    ]);
+  const allOrders = loadedOrders.map(
+    withChannelClassification,
+  );
   const orders =
     channel === "all"
       ? allOrders
@@ -583,6 +753,8 @@ export async function getFinanceSales(
       ecommerce: calculateProductCosts(ecommerceOrders),
       pos: calculateProductCosts(posOrders),
     },
+    shopifyqlSales: shopifyqlSales[channel],
+    shopifyqlSalesByChannel: shopifyqlSales,
     unexpectedSourceNames: getUnexpectedSourceNames(allOrders),
     period,
     timezone: shop.timezone,

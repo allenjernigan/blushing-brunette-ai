@@ -59,16 +59,6 @@ function money(value, currencyCode = "USD") {
   }).format(Number(value || 0));
 }
 
-function getMoneyAmount(object) {
-  return Number(object?.shopMoney?.amount || 0);
-}
-
-function sumMoney(orders, field) {
-  return orders.reduce((total, order) => {
-    return total + getMoneyAmount(order[field]);
-  }, 0);
-}
-
 function countUnitsSold(orders) {
   return orders.reduce((total, order) => {
     const orderUnits =
@@ -85,31 +75,6 @@ function countUnitsSold(orders) {
 
 function getOrderCurrentUnits(order) {
   return countUnitsSold([order]);
-}
-
-function calculateGrossProductSales(orders) {
-  return orders.reduce((orderTotal, order) => {
-    const lineItemTotal =
-      order.lineItems?.nodes?.reduce(
-        (lineTotal, lineItem) => {
-          const unitPrice = getMoneyAmount(
-            lineItem.originalUnitPriceSet,
-          );
-
-          const originalQuantity = Number(
-            lineItem.quantity || 0,
-          );
-
-          return (
-            lineTotal +
-            unitPrice * originalQuantity
-          );
-        },
-        0,
-      ) || 0;
-
-    return orderTotal + lineItemTotal;
-  }, 0);
 }
 
 function isValidPeriod(period) {
@@ -491,18 +456,14 @@ function calculateProcessingFees(orders, settings) {
   };
 }
 
-function buildFinanceSummary(orders, productCosts, settings) {
-  const grossProductSales =
-    calculateGrossProductSales(orders);
-  const discounts = sumMoney(orders, "totalDiscountsSet");
-  const originalNetProductSales = sumMoney(
-    orders,
-    "subtotalPriceSet",
-  );
-  const currentNetProductSales = sumMoney(
-    orders,
-    "currentSubtotalPriceSet",
-  );
+function buildFinanceSummary(
+  orders,
+  productCosts,
+  settings,
+  shopifyqlSales,
+) {
+  const currentNetProductSales =
+    shopifyqlSales.netProductSales;
   const profitSales = productCosts.isComplete
     ? currentNetProductSales
     : productCosts.knownCostSales;
@@ -531,27 +492,21 @@ function buildFinanceSummary(orders, productCosts, settings) {
       : 0;
 
   const metrics = {
-    orders: orders.length,
+    orders: shopifyqlSales.orders,
     unitsSold: countUnitsSold(orders),
-    grossProductSales,
-    discounts,
-    returnsAndEdits: Math.max(
-      0,
-      originalNetProductSales - currentNetProductSales,
-    ),
+    grossProductSales:
+      shopifyqlSales.grossProductSales,
+    discounts: shopifyqlSales.discounts,
+    returnsAndEdits:
+      shopifyqlSales.returnsAndEdits,
     netProductSales: currentNetProductSales,
-    shippingCollected: sumMoney(
-      orders,
-      "currentShippingPriceSet",
-    ),
-    taxes: sumMoney(orders, "currentTotalTaxSet"),
-    totalSales: sumMoney(orders, "currentTotalPriceSet"),
+    shippingCollected:
+      shopifyqlSales.shippingCollected,
+    taxes: shopifyqlSales.taxes,
+    totalSales: shopifyqlSales.totalSales,
+    averageOrderValue:
+      shopifyqlSales.averageOrderValue,
   };
-
-  metrics.averageOrderValue =
-    metrics.orders > 0
-      ? metrics.totalSales / metrics.orders
-      : 0;
 
   return {
     metrics,
@@ -725,6 +680,7 @@ const costIssueSummary = {
       orders,
       financeData.productCosts,
       savedSettings,
+      financeData.shopifyqlSales,
     );
   const channelBreakdown =
     selectedChannel === "all"
@@ -736,6 +692,8 @@ const costIssueSummary = {
             ),
             financeData.productCostsByChannel.ecommerce,
             savedSettings,
+            financeData.shopifyqlSalesByChannel
+              .ecommerce,
           ),
           pos: buildFinanceSummary(
             financeData.allOrders.filter(
@@ -743,6 +701,7 @@ const costIssueSummary = {
             ),
             financeData.productCostsByChannel.pos,
             savedSettings,
+            financeData.shopifyqlSalesByChannel.pos,
           ),
         }
       : null;
@@ -1198,9 +1157,9 @@ actionData.syncType === "orders" ? (
         />
 
         <MetricCard
-          label="Returns / Order Edits"
+          label="Sales Reversals"
           value={metrics.returnsAndEdits}
-          description="Reduction from original to current subtotal"
+          description="Refunds, returns, edits, and cancellations"
           currencyCode={currencyCode}
         />
 
@@ -1318,14 +1277,12 @@ actionData.syncType === "orders" ? (
             label="Discounts"
             value={metrics.discounts}
             currencyCode={currencyCode}
-            prefix="− "
           />
 
           <WaterfallRow
-            label="Returns / Order Edits"
+            label="Sales Reversals"
             value={metrics.returnsAndEdits}
             currencyCode={currencyCode}
-            prefix="− "
           />
 
           <WaterfallRow
