@@ -2,6 +2,7 @@ import {
   Form,
   useActionData,
   useLoaderData,
+  useLocation,
   useNavigation,
   useRouteError,
 } from "react-router";
@@ -18,12 +19,15 @@ import {
   getOrCreateShopSettings,
   serializeShopSettings,
 } from "../services/settings.server";
-import { FINANCE_PERIODS } from "../services/financeDateRange";
 import {
   getActiveChannelPreset,
   getPresetChannels,
 } from "../services/financeFilters";
 import { calculateWaterfallTotal } from "../services/financeShopifyql";
+import {
+  getFinanceRevalidationAction,
+  parseFinanceRequestUrl,
+} from "../services/financeRequest";
 import prisma from "../db.server";
 
 const PERIODS = [
@@ -111,10 +115,6 @@ function calculateGrossProductSales(orders) {
 
     return orderTotal + lineItemTotal;
   }, 0);
-}
-
-function isValidPeriod(period) {
-  return FINANCE_PERIODS.includes(period);
 }
 
 function classifyShippingEligibility(order) {
@@ -619,24 +619,15 @@ export const loader = async ({ request }) => {
 const { admin, session } =
   await authenticate.admin(request);
 
-  const url = new URL(request.url);
-
-  const requestedPeriod =
-    url.searchParams.get("period") || "today";
-
-  const selectedPeriod = isValidPeriod(
-    requestedPeriod,
-  )
-    ? requestedPeriod
-    : "today";
+  const {
+    selectedPeriod,
+    customStart,
+    customEnd,
+    requestedChannels,
+  } = parseFinanceRequestUrl(request.url);
   const savedSettings = serializeShopSettings(
     await getOrCreateShopSettings(session.shop),
   );
-  const requestedChannels = url.searchParams.has("channel")
-    ? url.searchParams.getAll("channel").filter(Boolean)
-    : null;
-  const customStart = url.searchParams.get("start") || "";
-  const customEnd = url.searchParams.get("end") || "";
 
   const financeData = await getFinanceSales(
     admin,
@@ -966,7 +957,9 @@ ChannelBreakdownTable.propTypes = {
 };
 
 export default function FinanceDashboard() {  const actionData = useActionData();
+  const location = useLocation();
   const navigation = useNavigation();
+  const revalidationAction = getFinanceRevalidationAction(location);
 
   const activeIntent =
   navigation.formData?.get("intent");
@@ -1030,7 +1023,7 @@ const isSyncingOrders =
             into the local finance database.
           </s-paragraph>
 
-<Form method="post">
+<Form method="post" action={revalidationAction}>
   <input
     type="hidden"
     name="intent"
@@ -1065,7 +1058,7 @@ const isSyncingOrders =
   </button>
 </Form>
 
-<Form method="post">
+<Form method="post" action={revalidationAction}>
   <input
     type="hidden"
     name="intent"
@@ -1176,7 +1169,7 @@ actionData.syncType === "orders" ? (
         </s-stack>
       </s-section>
       <s-section heading="Finance Filters">
-        <Form method="get">
+        <Form method="get" action="/app/finance">
           <div style={{ display: "grid", gap: "16px" }}>
             <fieldset style={{ border: 0, margin: 0, padding: 0 }}>
               <legend style={{ fontWeight: 600 }}>Date range</legend>
