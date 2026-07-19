@@ -12,7 +12,7 @@ automatically_update_urls_on_dev = false
 api_version = "2026-07"
 
 [access_scopes]
-scopes = "read_orders,read_inventory,read_locations,write_metaobject_definitions,write_metaobjects,write_products"
+scopes = "read_orders,read_inventory,read_locations,read_reports,write_metaobject_definitions,write_metaobjects,write_products"
 
 application_url = "https://blushing-brunette-ai.onrender.com"
 

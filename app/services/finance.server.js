@@ -1,8 +1,16 @@
-import { DateTime } from "luxon";
 import {
   buildProcessedAtRangeQuery,
+  FinanceDateRangeError,
+  getFinanceDateRange,
   isOrderWithinDateRange,
-} from "./financeDateRange";
+} from "./financeDateRange.js";
+import {
+  UNATTRIBUTED_CHANNEL,
+  getPresetChannels,
+  getPeriodChannelKeys,
+  normalizeOrderChannel,
+  normalizeShopifyChannel,
+} from "./financeFilters.js";
 
 const STANDARD_SOURCE_NAMES = new Set([
   "web",
@@ -17,16 +25,21 @@ export function normalizeSourceName(sourceName) {
 }
 
 export function classifyOrderChannel(order) {
-  return normalizeSourceName(order.sourceName) === "pos"
-    ? "pos"
-    : "ecommerce";
+  return normalizeOrderChannel(order);
 }
 
-function withChannelClassification(order) {
+function withChannelClassification(order, channelByKey) {
+  const salesChannel = classifyOrderChannel(order);
+
   return {
     ...order,
     rawSourceName: order.sourceName || null,
-    salesChannel: classifyOrderChannel(order),
+    salesChannel,
+    salesChannelLabel:
+      channelByKey.get(salesChannel)?.label ||
+      order.app?.name ||
+      "Unattributed",
+    isPos: channelByKey.get(salesChannel)?.isPos || false,
   };
 }
 
@@ -172,55 +185,104 @@ async function getShopSettings(admin) {
   };
 }
 
-function getPeriodRange(periodKey, timezone) {
-  const now = DateTime.now().setZone(timezone);
-
-  switch (periodKey) {
-    case "today":
-      return {
-        key: "today",
-        label: `Today — ${now.toFormat("MMMM d, yyyy")}`,
-        start: now.startOf("day").toUTC().toISO(),
-        end: now.toUTC().toISO(),
-      };
-
-    case "month-to-date":
-      return {
-        key: "month-to-date",
-        label: `Month to Date — ${now.toFormat("MMMM yyyy")}`,
-        start: now.startOf("month").toUTC().toISO(),
-        end: now.toUTC().toISO(),
-      };
-
-    case "last-month": {
-      const lastMonth = now.minus({ months: 1 });
-
-      return {
-        key: "last-month",
-        label: lastMonth.toFormat("MMMM yyyy"),
-        start: lastMonth.startOf("month").toUTC().toISO(),
-        end: now.startOf("month").toUTC().toISO(),
-      };
-    }
-
-    case "yesterday":
-    default: {
-      const yesterday = now.minus({ days: 1 });
-
-      return {
-        key: "yesterday",
-        label: `Yesterday — ${yesterday.toFormat(
-          "MMMM d, yyyy",
-        )}`,
-        start: yesterday.startOf("day").toUTC().toISO(),
-        end: yesterday
-          .plus({ days: 1 })
-          .startOf("day")
-          .toUTC()
-          .toISO(),
-      };
-    }
+export function parseShopifyqlResult(json) {
+  if (json.errors?.length) {
+    throw new Error(
+      json.errors.map((error) => error.message).join(", "),
+    );
   }
+
+  const result = json.data?.shopifyqlQuery;
+
+  if (!result) {
+    throw new Error("ShopifyQL returned no report data.");
+  }
+
+  if (result.parseErrors?.length) {
+    throw new Error(
+      `ShopifyQL could not parse the Finance report: ${result.parseErrors.join(", ")}`,
+    );
+  }
+
+  if (!result.tableData) {
+    throw new Error("ShopifyQL returned no report table.");
+  }
+
+  return result.tableData.rows || [];
+}
+
+async function runShopifyql(admin, query) {
+  const response = await admin.graphql(
+    `#graphql
+      query FinanceShopifyql($query: String!) {
+        shopifyqlQuery(query: $query) {
+          parseErrors
+          tableData {
+            columns {
+              name
+              dataType
+              displayName
+            }
+            rows
+          }
+        }
+      }
+    `,
+    { variables: { query } },
+  );
+
+  return parseShopifyqlResult(await response.json());
+}
+
+async function getSalesChannels(admin) {
+  const rows = await runShopifyql(
+    admin,
+    `FROM sales
+      SHOW total_sales, orders
+      GROUP BY sales_channel, is_pos_sale
+      SINCE 2000-01-01 UNTIL today
+      ORDER BY total_sales DESC`,
+  );
+
+  const channelsByKey = new Map();
+
+  for (const row of rows) {
+    const channel = normalizeShopifyChannel(
+      row.sales_channel,
+      row.is_pos_sale === true || row.is_pos_sale === "true",
+    );
+    const existing = channelsByKey.get(channel.key);
+    channelsByKey.set(channel.key, {
+      ...channel,
+      isPos: channel.isPos || existing?.isPos || false,
+    });
+  }
+
+  if (!channelsByKey.has(UNATTRIBUTED_CHANNEL)) {
+    const unattributed = normalizeShopifyChannel(null);
+    channelsByKey.set(unattributed.key, unattributed);
+  }
+
+  return Array.from(channelsByKey.values());
+}
+
+async function getPeriodChannelSales(admin, period) {
+  const rows = await runShopifyql(
+    admin,
+    `FROM sales
+      SHOW total_sales, orders, net_sales, returns
+      GROUP BY sales_channel
+      SINCE ${period.startDate} UNTIL ${period.endDate}
+      ORDER BY total_sales DESC`,
+  );
+
+  return rows.map((row) => ({
+    channel: normalizeShopifyChannel(row.sales_channel),
+    totalSales: Number(row.total_sales || 0),
+    orders: Number(row.orders || 0),
+    netSales: Number(row.net_sales || 0),
+    returns: Number(row.returns || 0),
+  }));
 }
 
 async function getOrdersForRange(admin, start, end) {
@@ -249,6 +311,10 @@ async function getOrdersForRange(admin, start, end) {
               createdAt
               processedAt
               sourceName
+              app {
+                id
+                name
+              }
               requiresShipping
               displayFinancialStatus
               displayFulfillmentStatus
@@ -545,44 +611,106 @@ async function getRemainingOrderLineItems(
 
 export async function getFinanceSales(
   admin,
-  periodKey,
-  channel = "ecommerce",
+  {
+    periodKey = "today",
+    customStart,
+    customEnd,
+    requestedChannels = null,
+  } = {},
 ) {
   const shop = await getShopSettings(admin);
-
-  const period = getPeriodRange(
-    periodKey,
-    shop.timezone,
+  const channels = await getSalesChannels(admin);
+  const channelByKey = new Map(
+    channels.map((channel) => [channel.key, channel]),
   );
-
-  const allOrders = (
-    await getOrdersForRange(
-    admin,
-    period.start,
-    period.end,
-    )
-  ).map(withChannelClassification);
-  const orders =
-    channel === "all"
-      ? allOrders
-      : allOrders.filter(
-          (order) => order.salesChannel === channel,
+  const validChannelKeys = new Set(channelByKey.keys());
+  const selectedChannels =
+    requestedChannels === null
+      ? getPresetChannels("all", channels)
+      : Array.from(new Set(requestedChannels)).filter((channel) =>
+          validChannelKeys.has(channel),
         );
-  const ecommerceOrders = allOrders.filter(
-    (order) => order.salesChannel === "ecommerce",
+
+  let period;
+  let dateError = null;
+
+  try {
+    period = getFinanceDateRange({
+      periodKey,
+      timezone: shop.timezone,
+      customStart,
+      customEnd,
+    });
+  } catch (error) {
+    if (!(error instanceof FinanceDateRangeError)) throw error;
+
+    dateError = error.message;
+    period = {
+      key: periodKey,
+      label: "Custom range needs attention",
+      start: null,
+      end: null,
+      startDate: customStart || "",
+      endDate: customEnd || "",
+    };
+  }
+
+  const [rawOrders, shopifyChannelSales] = dateError
+    ? [[], []]
+    : await Promise.all([
+        getOrdersForRange(admin, period.start, period.end),
+        getPeriodChannelSales(admin, period),
+      ]);
+  const allOrders = rawOrders.map((order) =>
+    withChannelClassification(order, channelByKey),
   );
-  const posOrders = allOrders.filter(
-    (order) => order.salesChannel === "pos",
+  const selectedChannelSet = new Set(selectedChannels);
+  const orders = allOrders.filter((order) =>
+    selectedChannelSet.has(order.salesChannel),
   );
+  const ordersByChannel = new Map();
+
+  for (const order of allOrders) {
+    const channelOrders = ordersByChannel.get(order.salesChannel) || [];
+    channelOrders.push(order);
+    ordersByChannel.set(order.salesChannel, channelOrders);
+  }
+
+  const channelSalesByKey = new Map(
+    shopifyChannelSales.map((summary) => [
+      summary.channel.key,
+      summary,
+    ]),
+  );
+  const activeChannelKeys = getPeriodChannelKeys(
+    shopifyChannelSales,
+    allOrders,
+  );
+  const channelBreakdown = activeChannelKeys.map((key) => {
+    const channel =
+      channelByKey.get(key) ||
+      channelSalesByKey.get(key)?.channel ||
+      normalizeShopifyChannel(
+        key === UNATTRIBUTED_CHANNEL ? null : key,
+      );
+    const channelOrders = ordersByChannel.get(key) || [];
+
+    return {
+      channel,
+      shopify: channelSalesByKey.get(key) || null,
+      orders: channelOrders,
+      productCosts: calculateProductCosts(channelOrders),
+    };
+  });
 
   return {
     orders,
     allOrders,
     productCosts: calculateProductCosts(orders),
-    productCostsByChannel: {
-      ecommerce: calculateProductCosts(ecommerceOrders),
-      pos: calculateProductCosts(posOrders),
-    },
+    channels,
+    selectedChannels,
+    channelBreakdown,
+    dateError,
     unexpectedSourceNames: getUnexpectedSourceNames(allOrders),
     period,
     timezone: shop.timezone,

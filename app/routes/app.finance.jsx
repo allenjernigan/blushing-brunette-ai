@@ -1,11 +1,11 @@
 import {
   Form,
-  Link,
   useActionData,
   useLoaderData,
   useNavigation,
   useRouteError,
 } from "react-router";
+import { useEffect, useState } from "react";
 import PropTypes from "prop-types";
 import {
   syncOrders,
@@ -15,10 +15,14 @@ import { boundary } from "@shopify/shopify-app-react-router/server";
 import { authenticate } from "../shopify.server";
 import { getFinanceSales } from "../services/finance.server";
 import {
-  FINANCE_CHANNELS,
   getOrCreateShopSettings,
   serializeShopSettings,
 } from "../services/settings.server";
+import { FINANCE_PERIODS } from "../services/financeDateRange";
+import {
+  getActiveChannelPreset,
+  getPresetChannels,
+} from "../services/financeFilters";
 import prisma from "../db.server";
 
 const PERIODS = [
@@ -31,6 +35,10 @@ const PERIODS = [
     label: "Yesterday",
   },
   {
+    key: "last-7-days",
+    label: "Last 7 Days",
+  },
+  {
     key: "month-to-date",
     label: "Month to Date",
   },
@@ -38,19 +46,11 @@ const PERIODS = [
     key: "last-month",
     label: "Last Month",
   },
+  {
+    key: "custom",
+    label: "Custom Range",
+  },
 ];
-
-const CHANNEL_OPTIONS = [
-  { key: "ecommerce", label: "Ecommerce" },
-  { key: "pos", label: "POS" },
-  { key: "all", label: "All Channels" },
-];
-
-const CHANNEL_CONTEXT = {
-  ecommerce: "Ecommerce only",
-  pos: "POS only",
-  all: "All channels",
-};
 
 function money(value, currencyCode = "USD") {
   return new Intl.NumberFormat("en-US", {
@@ -113,19 +113,13 @@ function calculateGrossProductSales(orders) {
 }
 
 function isValidPeriod(period) {
-  return PERIODS.some(
-    (option) => option.key === period,
-  );
-}
-
-function isValidChannel(channel) {
-  return FINANCE_CHANNELS.includes(channel);
+  return FINANCE_PERIODS.includes(period);
 }
 
 function classifyShippingEligibility(order) {
   const hasCurrentUnits = getOrderCurrentUnits(order) > 0;
 
-  if (order.salesChannel === "ecommerce") {
+  if (!order.isPos) {
     return !order.cancelledAt && hasCurrentUnits
       ? "ecommerce-shipment"
       : "excluded";
@@ -256,8 +250,8 @@ function isKnownZeroFeeMethod(transaction) {
   );
 }
 
-function getProcessingAssumptions(channel, settings) {
-  if (channel === "pos") {
+function getProcessingAssumptions(isPos, settings) {
+  if (isPos) {
     return {
       percentage: Number(settings.posProcessingPercentage),
       fixedFee: Number(settings.posProcessingFixedFee),
@@ -283,7 +277,7 @@ function addPaymentMethodCoverage(
   const key = `${order.salesChannel}::${gateway}`;
   const existing = paymentMethods.get(key) || {
     gateway,
-    channel: order.salesChannel,
+    channel: order.salesChannelLabel,
     orderIds: new Set(),
     salesAmount: 0,
     actualFees: 0,
@@ -421,7 +415,7 @@ function calculateProcessingFees(orders, settings) {
       (transaction) => !isKnownZeroFeeMethod(transaction),
     );
     const assumptions = getProcessingAssumptions(
-      order.salesChannel,
+      order.isPos,
       settings,
     );
     const percentageRate = assumptions.percentage / 100;
@@ -630,17 +624,20 @@ const { admin, session } =
   const savedSettings = serializeShopSettings(
     await getOrCreateShopSettings(session.shop),
   );
-  const requestedChannel = url.searchParams.get("channel");
-  const selectedChannel = isValidChannel(requestedChannel)
-    ? requestedChannel
-    : isValidChannel(savedSettings.defaultFinanceChannel)
-      ? savedSettings.defaultFinanceChannel
-      : "ecommerce";
+  const requestedChannels = url.searchParams.has("channel")
+    ? url.searchParams.getAll("channel").filter(Boolean)
+    : null;
+  const customStart = url.searchParams.get("start") || "";
+  const customEnd = url.searchParams.get("end") || "";
 
   const financeData = await getFinanceSales(
     admin,
-    selectedPeriod,
-    selectedChannel,
+    {
+      periodKey: selectedPeriod,
+      customStart,
+      customEnd,
+      requestedChannels,
+    },
   );
   const [
   missingCostCount,
@@ -726,31 +723,47 @@ const costIssueSummary = {
       financeData.productCosts,
       savedSettings,
     );
-  const channelBreakdown =
-    selectedChannel === "all"
-      ? {
-          ecommerce: buildFinanceSummary(
-            financeData.allOrders.filter(
-              (order) =>
-                order.salesChannel === "ecommerce",
-            ),
-            financeData.productCostsByChannel.ecommerce,
-            savedSettings,
-          ),
-          pos: buildFinanceSummary(
-            financeData.allOrders.filter(
-              (order) => order.salesChannel === "pos",
-            ),
-            financeData.productCostsByChannel.pos,
-            savedSettings,
-          ),
-        }
-      : null;
+  const channelBreakdown = financeData.channelBreakdown
+    .map((entry) => {
+      const operational = buildFinanceSummary(
+        entry.orders,
+        entry.productCosts,
+        savedSettings,
+      );
+      const totalSales =
+        entry.shopify?.totalSales ?? operational.metrics.totalSales;
+      const orderCount =
+        entry.shopify?.orders ?? operational.metrics.orders;
+
+      return {
+        key: entry.channel.key,
+        label: entry.channel.label,
+        totalSales,
+        orders: orderCount,
+        averageOrderValue:
+          orderCount > 0 ? totalSales / orderCount : 0,
+        netSales:
+          entry.shopify?.netSales ??
+          operational.metrics.netProductSales,
+        returns:
+          entry.shopify?.returns ??
+          -operational.metrics.returnsAndEdits,
+        productCogs: operational.profitability.knownCogs,
+        grossProfit: operational.profitability.grossProfit,
+        contributionProfit:
+          operational.profitability.contributionProfit,
+        hasOrderCoverage: entry.orders.length > 0,
+      };
+    })
+    .sort((left, right) => right.totalSales - left.totalSales);
 
 return {
   selectedPeriod,
-  selectedChannel,
-  channelContext: CHANNEL_CONTEXT[selectedChannel],
+  selectedChannels: financeData.selectedChannels,
+  channels: financeData.channels,
+  customStart,
+  customEnd,
+  dateError: financeData.dateError,
   period: financeData.period,
   timezone: financeData.timezone,
   currencyCode: financeData.currencyCode,
@@ -843,6 +856,64 @@ WaterfallRow.propTypes = {
   strong: PropTypes.bool,
 };
 
+function ChannelBreakdownTable({ rows, currencyCode }) {
+  if (rows.length === 0) {
+    return <s-paragraph>No channel sales were found for this period.</s-paragraph>;
+  }
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "960px" }}>
+        <thead>
+          <tr>
+            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Returns", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
+              <th key={heading} scope="col" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #c9cccf" }}>
+                {heading}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={row.key}>
+              <th scope="row" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #e1e3e5" }}>
+                {row.label}
+              </th>
+              <td>{money(row.totalSales, currencyCode)}</td>
+              <td>{row.orders}</td>
+              <td>{money(row.averageOrderValue, currencyCode)}</td>
+              <td>{money(row.netSales, currencyCode)}</td>
+              <td>{money(row.returns, currencyCode)}</td>
+              <td>{row.hasOrderCoverage ? money(row.productCogs, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasOrderCoverage ? money(row.grossProfit, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasOrderCoverage ? money(row.contributionProfit, currencyCode) : "Unavailable"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+ChannelBreakdownTable.propTypes = {
+  rows: PropTypes.arrayOf(
+    PropTypes.shape({
+      key: PropTypes.string.isRequired,
+      label: PropTypes.string.isRequired,
+      totalSales: PropTypes.number.isRequired,
+      orders: PropTypes.number.isRequired,
+      averageOrderValue: PropTypes.number.isRequired,
+      netSales: PropTypes.number.isRequired,
+      returns: PropTypes.number.isRequired,
+      productCogs: PropTypes.number.isRequired,
+      grossProfit: PropTypes.number.isRequired,
+      contributionProfit: PropTypes.number.isRequired,
+      hasOrderCoverage: PropTypes.bool.isRequired,
+    }),
+  ).isRequired,
+  currencyCode: PropTypes.string.isRequired,
+};
+
 export default function FinanceDashboard() {  const actionData = useActionData();
   const navigation = useNavigation();
 
@@ -859,8 +930,11 @@ const isSyncingOrders =
 
  const {
   selectedPeriod,
-  selectedChannel,
-  channelContext,
+  selectedChannels,
+  channels,
+  customStart,
+  customEnd,
+  dateError,
   period,
   timezone,
   currencyCode,
@@ -872,6 +946,26 @@ const isSyncingOrders =
   channelBreakdown,
   unexpectedSourceNames,
 } = useLoaderData();
+  const [filterPeriod, setFilterPeriod] = useState(selectedPeriod);
+  const [channelSelection, setChannelSelection] = useState(
+    selectedChannels,
+  );
+  useEffect(() => {
+    setFilterPeriod(selectedPeriod);
+    setChannelSelection(selectedChannels);
+  }, [selectedChannels, selectedPeriod]);
+  const activePreset = getActiveChannelPreset(
+    channelSelection,
+    channels,
+  );
+
+  function toggleChannel(channelKey) {
+    setChannelSelection((current) =>
+      current.includes(channelKey)
+        ? current.filter((key) => key !== channelKey)
+        : [...current, channelKey],
+    );
+  }
 
   return (
     <s-page heading="Finance">
@@ -1028,113 +1122,97 @@ actionData.syncType === "orders" ? (
 ) : null}
         </s-stack>
       </s-section>
-      <s-section heading="Performance Period">
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "8px",
-            marginBottom: "16px",
-          }}
-        >
-          {PERIODS.map((option) => {
-            const isSelected =
-              selectedPeriod === option.key;
-
-            return (
-              <Link
-                key={option.key}
-                to={
-                  "/app/finance?period=" +
-                  option.key +
-                  "&channel=" +
-                  selectedChannel
-                }
-                style={{
-                  display: "inline-block",
-                  padding: "8px 14px",
-                  borderRadius: "8px",
-                  border: isSelected
-                    ? "1px solid #202223"
-                    : "1px solid #c9cccf",
-                  background: isSelected
-                    ? "#202223"
-                    : "#ffffff",
-                  color: isSelected
-                    ? "#ffffff"
-                    : "#202223",
-                  textDecoration: "none",
-                  fontWeight: isSelected
-                    ? 600
-                    : 400,
-                }}
+      <s-section heading="Finance Filters">
+        <Form method="get">
+          <div style={{ display: "grid", gap: "16px" }}>
+            <label>
+              <span style={{ display: "block", fontWeight: 600 }}>
+                Date range
+              </span>
+              <select
+                name="period"
+                value={filterPeriod}
+                onChange={(event) => setFilterPeriod(event.target.value)}
+                style={{ marginTop: "6px", padding: "8px 12px" }}
               >
-                {option.label}
-              </Link>
-            );
-          })}
-        </div>
+                {PERIODS.map((option) => (
+                  <option key={option.key} value={option.key}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
 
+            {filterPeriod === "custom" ? (
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "12px" }}>
+                <label>
+                  Start date
+                  <input name="start" type="date" defaultValue={customStart} />
+                </label>
+                <label>
+                  End date
+                  <input name="end" type="date" defaultValue={customEnd} />
+                </label>
+              </div>
+            ) : null}
+
+            <div>
+              <strong>Sales channels</strong>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "8px" }}>
+                {[
+                  ["all-except-pos", "All channels except POS"],
+                  ["pos-only", "POS only"],
+                  ["all", "All channels"],
+                ].map(([preset, label]) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setChannelSelection(getPresetChannels(preset, channels))}
+                    aria-pressed={activePreset === preset}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <button type="button" onClick={() => setChannelSelection(channels.map((channel) => channel.key))}>
+                  Select all
+                </button>
+                <button type="button" onClick={() => setChannelSelection([])}>
+                  Clear all
+                </button>
+              </div>
+              <div style={{ display: "grid", gap: "8px", marginTop: "12px" }}>
+                {channels.map((channel) => (
+                  <label key={channel.key}>
+                    <input
+                      type="checkbox"
+                      name="channel"
+                      value={channel.key}
+                      checked={channelSelection.includes(channel.key)}
+                      onChange={() => toggleChannel(channel.key)}
+                    />{" "}
+                    {channel.label}{channel.isPos ? " (POS)" : ""}
+                  </label>
+                ))}
+                {channelSelection.length === 0 ? (
+                  <input type="hidden" name="channel" value="" />
+                ) : null}
+              </div>
+            </div>
+
+            <button type="submit" style={{ justifySelf: "start" }}>
+              Apply filters
+            </button>
+          </div>
+        </Form>
+
+        {dateError ? <s-paragraph>⚠ {dateError}</s-paragraph> : null}
+        <s-paragraph>{period.label}</s-paragraph>
         <s-paragraph>
-          <strong>Sales Channel</strong>
+          {selectedChannels.length} of {channels.length} channels selected. Dates use {timezone}.
         </s-paragraph>
-
-        <div
-          style={{
-            display: "flex",
-            flexWrap: "wrap",
-            gap: "8px",
-            margin: "8px 0 16px",
-          }}
-        >
-          {CHANNEL_OPTIONS.map((option) => {
-            const isSelected =
-              selectedChannel === option.key;
-
-            return (
-              <Link
-                key={option.key}
-                to={
-                  "/app/finance?period=" +
-                  selectedPeriod +
-                  "&channel=" +
-                  option.key
-                }
-                style={{
-                  display: "inline-block",
-                  padding: "8px 14px",
-                  borderRadius: "8px",
-                  border: isSelected
-                    ? "1px solid #202223"
-                    : "1px solid #c9cccf",
-                  background: isSelected
-                    ? "#202223"
-                    : "#ffffff",
-                  color: isSelected
-                    ? "#ffffff"
-                    : "#202223",
-                  textDecoration: "none",
-                  fontWeight: isSelected ? 600 : 400,
-                }}
-              >
-                {option.label}
-              </Link>
-            );
-          })}
-        </div>
-
-        <s-paragraph>
-          {period.label}
-        </s-paragraph>
-
-        <s-paragraph>
-          Active channel: <strong>{channelContext}</strong>
-        </s-paragraph>
-
-        <s-paragraph>
-          Shopify activity based on the store
-          timezone: {timezone}.
-        </s-paragraph>
+        {selectedChannels.length === 0 ? (
+          <s-paragraph>No sales channels are selected. Select one or more channels to populate the main metrics.</s-paragraph>
+        ) : null}
       </s-section>
 
       <div
@@ -1219,89 +1297,6 @@ actionData.syncType === "orders" ? (
         />
       </div>
 
-      {channelBreakdown ? (
-        <s-section heading="Ecommerce versus POS">
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns:
-                "repeat(auto-fit, minmax(280px, 1fr))",
-              gap: "16px",
-            }}
-          >
-            {[
-              ["Ecommerce", channelBreakdown.ecommerce],
-              ["POS", channelBreakdown.pos],
-            ].map(([label, summary]) => (
-              <s-box
-                key={label}
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-              >
-                <s-heading>{label}</s-heading>
-                <s-paragraph>
-                  Sales:{" "}
-                  {money(
-                    summary.metrics.totalSales,
-                    currencyCode,
-                  )}
-                </s-paragraph>
-                <s-paragraph>
-                  Orders: {summary.metrics.orders}
-                </s-paragraph>
-                <s-paragraph>
-                  Units: {summary.metrics.unitsSold}
-                </s-paragraph>
-                <s-paragraph>
-                  COGS:{" "}
-                  {money(
-                    summary.profitability.knownCogs,
-                    currencyCode,
-                  )}
-                </s-paragraph>
-                <s-paragraph>
-                  Gross profit:{" "}
-                  {money(
-                    summary.profitability.grossProfit,
-                    currencyCode,
-                  )}
-                </s-paragraph>
-                <s-paragraph>
-                  Estimated shipping:{" "}
-                  {money(
-                    summary.profitability
-                      .estimatedShippingExpense,
-                    currencyCode,
-                  )}
-                </s-paragraph>
-                <s-paragraph>
-                  Processing fees:{" "}
-                  {money(
-                    summary.profitability.processingFees
-                      .totalFees,
-                    currencyCode,
-                  )}{" "}
-                  (
-                  {money(
-                    summary.profitability.processingFees
-                      .actualFees,
-                    currencyCode,
-                  )}{" "}
-                  actual,{" "}
-                  {money(
-                    summary.profitability.processingFees
-                      .estimatedFees,
-                    currencyCode,
-                  )}{" "}
-                  estimated)
-                </s-paragraph>
-              </s-box>
-            ))}
-          </div>
-        </s-section>
-      ) : null}
-
       <s-section heading="Sales Breakdown">
         <s-box
           padding="base"
@@ -1369,74 +1364,6 @@ actionData.syncType === "orders" ? (
             </span>
           </div>
         </s-box>
-      </s-section>
-
-      <s-section heading="Orders Included">
-        {orders.length > 0 ? (
-          <s-stack direction="block" gap="base">
-            {orders.map((order) => {
-              const orderUnits =
-                order.lineItems?.nodes?.reduce(
-                  (total, lineItem) =>
-                    total +
-                    Number(
-                      lineItem.currentQuantity ||
-                        0,
-                    ),
-                  0,
-                ) || 0;
-
-              return (
-                <s-box
-                  key={order.id}
-                  padding="base"
-                  borderWidth="base"
-                  borderRadius="base"
-                >
-                  <s-paragraph>
-                    <strong>{order.name}</strong>
-                  </s-paragraph>
-
-                  <s-paragraph>
-                    {money(
-                      order
-                        .currentTotalPriceSet
-                        ?.shopMoney?.amount,
-                      currencyCode,
-                    )}{" "}
-                    · {orderUnits} units ·{" "}
-                    {
-                      order.displayFinancialStatus
-                    }
-                  </s-paragraph>
-
-                  <s-paragraph>
-                    Channel: {order.salesChannel === "pos"
-                      ? "POS"
-                      : "Ecommerce"}{" "}
-                    · Shopify source:{" "}
-                    {order.rawSourceName || "Not provided"}
-                    {order.retailLocation?.name
-                      ? " · Location: " +
-                        order.retailLocation.name
-                      : ""}
-                  </s-paragraph>
-
-                  {order.cancelledAt ? (
-                    <s-paragraph>
-                      ⚠ This order was cancelled.
-                    </s-paragraph>
-                  ) : null}
-                </s-box>
-              );
-            })}
-          </s-stack>
-        ) : (
-          <s-paragraph>
-            No orders were processed during{" "}
-            {period.label}.
-          </s-paragraph>
-        )}
       </s-section>
 
       <s-section heading="Data Quality">
@@ -1568,7 +1495,7 @@ actionData.syncType === "orders" ? (
               {unexpectedSourceNames.length === 1
                 ? ""
                 : "s"}{" "}
-              classified as Ecommerce:{" "}
+              found in Shopify source diagnostics:{" "}
               {unexpectedSourceNames.join(", ")}.
             </s-paragraph>
           ) : (
@@ -2096,6 +2023,13 @@ actionData.syncType === "orders" ? (
   )}
 </s-section>
 
+<s-section heading="Channel Breakdown">
+  <s-paragraph>
+    Shopify sales metrics are shown for every channel active in this period, regardless of the channel selection above. Cost and profit columns use matching order-level data.
+  </s-paragraph>
+  <ChannelBreakdownTable rows={channelBreakdown} currencyCode={currencyCode} />
+</s-section>
+
 <s-section heading="Payment Methods and Gateways">
   {profitability.processingFees.paymentMethods.length > 0 ? (
     <s-stack direction="block" gap="base">
@@ -2129,9 +2063,7 @@ actionData.syncType === "orders" ? (
               </s-paragraph>
               <s-paragraph>
                 Channel:{" "}
-                {method.channel === "pos"
-                  ? "POS"
-                  : "Ecommerce"}
+                {method.channel}
               </s-paragraph>
               <s-paragraph>
                 Orders: {method.orderCount}
@@ -2171,12 +2103,12 @@ actionData.syncType === "orders" ? (
     }}
   >
     <MetricCard
-      label="Ecommerce Orders Charged"
+      label="Non-POS Orders Charged"
       value={
         profitability.estimatedShipping
           .ecommerceShipments
       }
-      description="Eligible ecommerce shipments"
+      description="Eligible shipments from non-POS channels"
       currencyCode={currencyCode}
       isMoney={false}
     />

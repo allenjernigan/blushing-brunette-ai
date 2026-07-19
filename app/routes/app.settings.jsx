@@ -123,6 +123,11 @@ export default function SettingsPage() {
         </s-paragraph>
 
         <Form method="post">
+          <input
+            type="hidden"
+            name="defaultFinanceChannel"
+            value={values.defaultFinanceChannel}
+          />
           <div
             style={{
               display: "grid",
@@ -170,7 +175,7 @@ export default function SettingsPage() {
               </label>
             ))}
 
-            <label>
+            <div>
               <span
                 style={{
                   display: "block",
@@ -178,35 +183,12 @@ export default function SettingsPage() {
                   marginBottom: "6px",
                 }}
               >
-                Default Finance channel
+                Default Finance channel (deprecated)
               </span>
-              <select
-                name="defaultFinanceChannel"
-                defaultValue={values.defaultFinanceChannel}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  border: "1px solid #8c9196",
-                  borderRadius: "8px",
-                  background: "#ffffff",
-                }}
-              >
-                <option value="ecommerce">Ecommerce</option>
-                <option value="pos">POS</option>
-                <option value="all">All Channels</option>
-              </select>
-              {errors.defaultFinanceChannel ? (
-                <span
-                  style={{
-                    display: "block",
-                    color: "#b42318",
-                    marginTop: "4px",
-                  }}
-                >
-                  {errors.defaultFinanceChannel}
-                </span>
-              ) : null}
-            </label>
+              <s-paragraph>
+                Finance now defaults to all discovered channels and stores selections in the report URL. The previous saved value is preserved for compatibility.
+              </s-paragraph>
+            </div>
 
             {actionData?.success ? (
               <s-paragraph>✅ Settings saved.</s-paragraph>
