@@ -87,72 +87,27 @@ function isValidChannel(channel) {
   return FINANCE_CHANNELS.includes(channel);
 }
 
-function classifyShippingEligibility(order) {
-  const hasCurrentUnits = getOrderCurrentUnits(order) > 0;
-
-  if (order.salesChannel === "ecommerce") {
-    return !order.cancelledAt && hasCurrentUnits
-      ? "ecommerce-shipment"
-      : "excluded";
-  }
-
-  if (order.cancelledAt || !hasCurrentUnits) {
-    return "excluded";
-  }
-
-  const isFulfilled = [
-    "FULFILLED",
-    "PARTIALLY_FULFILLED",
-  ].includes(order.displayFulfillmentStatus);
-
-  if (order.requiresShipping === true && isFulfilled) {
-    return "pos-shipment";
-  }
-
-  if (
-    order.requiresShipping === false &&
-    order.retailLocation
-  ) {
-    return "pos-walkout";
-  }
-
-  return "ambiguous";
-}
-
 function calculateEstimatedShipping(orders, settings) {
-  const counts = {
-    ecommerceShipments: 0,
-    posShipments: 0,
-    posWalkouts: 0,
-    ambiguous: 0,
-  };
+  let ecommerceShipments = 0;
 
   for (const order of orders) {
-    const eligibility = classifyShippingEligibility(order);
-
-    if (eligibility === "ecommerce-shipment") {
-      counts.ecommerceShipments += 1;
-    } else if (eligibility === "pos-shipment") {
-      counts.posShipments += 1;
-    } else if (eligibility === "pos-walkout") {
-      counts.posWalkouts += 1;
-    } else if (eligibility === "ambiguous") {
-      counts.ambiguous += 1;
+    if (
+      order.salesChannel === "ecommerce" &&
+      !order.cancelledAt &&
+      getOrderCurrentUnits(order) > 0
+    ) {
+      ecommerceShipments += 1;
     }
   }
 
   const ecommerceCost = Number(
     settings.ecommerceShippingCost,
   );
-  const posCost = Number(settings.posShippingCost);
 
   return {
-    ...counts,
+    ecommerceShipments,
     ecommerceCost,
-    posCost,
-    expense:
-      counts.ecommerceShipments * ecommerceCost +
-      counts.posShipments * posCost,
+    expense: ecommerceShipments * ecommerceCost,
   };
 }
 
@@ -1328,74 +1283,6 @@ actionData.syncType === "orders" ? (
         </s-box>
       </s-section>
 
-      <s-section heading="Orders Included">
-        {orders.length > 0 ? (
-          <s-stack direction="block" gap="base">
-            {orders.map((order) => {
-              const orderUnits =
-                order.lineItems?.nodes?.reduce(
-                  (total, lineItem) =>
-                    total +
-                    Number(
-                      lineItem.currentQuantity ||
-                        0,
-                    ),
-                  0,
-                ) || 0;
-
-              return (
-                <s-box
-                  key={order.id}
-                  padding="base"
-                  borderWidth="base"
-                  borderRadius="base"
-                >
-                  <s-paragraph>
-                    <strong>{order.name}</strong>
-                  </s-paragraph>
-
-                  <s-paragraph>
-                    {money(
-                      order
-                        .currentTotalPriceSet
-                        ?.shopMoney?.amount,
-                      currencyCode,
-                    )}{" "}
-                    · {orderUnits} units ·{" "}
-                    {
-                      order.displayFinancialStatus
-                    }
-                  </s-paragraph>
-
-                  <s-paragraph>
-                    Channel: {order.salesChannel === "pos"
-                      ? "POS"
-                      : "Ecommerce"}{" "}
-                    · Shopify source:{" "}
-                    {order.rawSourceName || "Not provided"}
-                    {order.retailLocation?.name
-                      ? " · Location: " +
-                        order.retailLocation.name
-                      : ""}
-                  </s-paragraph>
-
-                  {order.cancelledAt ? (
-                    <s-paragraph>
-                      ⚠ This order was cancelled.
-                    </s-paragraph>
-                  ) : null}
-                </s-box>
-              );
-            })}
-          </s-stack>
-        ) : (
-          <s-paragraph>
-            No orders were processed during{" "}
-            {period.label}.
-          </s-paragraph>
-        )}
-      </s-section>
-
       <s-section heading="Data Quality">
         <s-stack direction="block" gap="base">
           <s-paragraph>
@@ -1935,13 +1822,6 @@ actionData.syncType === "orders" ? (
                 .ecommerceCost,
               currencyCode,
             ),
-            " + ",
-            profitability.estimatedShipping.posShipments,
-            " shipped POS × ",
-            money(
-              profitability.estimatedShipping.posCost,
-              currencyCode,
-            ),
           ].join("")}
           currencyCode={currencyCode}
         />
@@ -2134,31 +2014,6 @@ actionData.syncType === "orders" ? (
           .ecommerceShipments
       }
       description="Eligible ecommerce shipments"
-      currencyCode={currencyCode}
-      isMoney={false}
-    />
-    <MetricCard
-      label="POS Orders Charged"
-      value={
-        profitability.estimatedShipping.posShipments
-      }
-      description="POS orders reliably identified as shipped"
-      currencyCode={currencyCode}
-      isMoney={false}
-    />
-    <MetricCard
-      label="POS Walk-Out Orders Excluded"
-      value={
-        profitability.estimatedShipping.posWalkouts
-      }
-      description="Ordinary POS orders not charged shipping"
-      currencyCode={currencyCode}
-      isMoney={false}
-    />
-    <MetricCard
-      label="Ambiguous Orders Not Charged"
-      value={profitability.estimatedShipping.ambiguous}
-      description="Shipping status requires review"
       currencyCode={currencyCode}
       isMoney={false}
     />
