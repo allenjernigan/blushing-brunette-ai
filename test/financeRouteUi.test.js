@@ -35,8 +35,8 @@ test("custom date controls submit and retain start and end URL values", () => {
   assert.match(requestSource, /url\.searchParams\.get\("end"\)/);
 });
 
-test("keeps customer shipping revenue separate from estimated shipping expense", () => {
-  assert.match(routeSource, /label="Shipping Charges"/);
+test("keeps net shipping separate from estimated shipping expense", () => {
+  assert.match(routeSource, /label="Net Shipping"/);
   assert.match(routeSource, /label="Estimated Shipping Expense"/);
-  assert.doesNotMatch(routeSource, /label="Shipping Collected"/);
+  assert.match(routeSource, /value=\{metrics\.netShipping\}/);
 });

@@ -123,10 +123,6 @@ export async function executeFinanceGraphql(
       JSON.stringify(expandedGraphQLErrors, null, 2),
     );
     console.error("[Finance GraphQL operation]", operationName);
-    console.error(
-      "[Finance GraphQL wrapper message]",
-      error?.message,
-    );
     throw error;
   }
 }
@@ -326,16 +322,7 @@ export function parseShopifyqlResult(json) {
   return result.tableData.rows || [];
 }
 
-async function runShopifyql(admin, shopifyqlQueryString, dateInputs) {
-  console.error(
-    "[Finance ShopifyQL query]",
-    shopifyqlQueryString,
-  );
-  console.error(
-    "[Finance ShopifyQL date inputs]",
-    JSON.stringify(dateInputs, null, 2),
-  );
-
+async function runShopifyql(admin, shopifyqlQueryString) {
   try {
     const response = await executeFinanceGraphql(
       admin,
@@ -385,12 +372,7 @@ async function getSalesChannels(admin) {
       GROUP BY sales_channel, is_pos_sale
       SINCE 2000-01-01 UNTIL today
       ORDER BY total_sales DESC`;
-  const rows = await runShopifyql(admin, shopifyqlQueryString, {
-    period: "channel-discovery",
-    start: "2000-01-01",
-    end: "today",
-    dateClause: "SINCE 2000-01-01 UNTIL today",
-  });
+  const rows = await runShopifyql(admin, shopifyqlQueryString);
 
   const channelsByKey = new Map();
 
@@ -416,12 +398,7 @@ async function getSalesChannels(admin) {
 
 async function getPeriodChannelSales(admin, period) {
   const shopifyqlQueryString = buildPeriodSalesQuery(period);
-  const rows = await runShopifyql(admin, shopifyqlQueryString, {
-    period: period.key,
-    start: period.startDate,
-    end: period.endDate,
-    dateClause: `SINCE ${period.startDate} UNTIL ${period.endDate}`,
-  });
+  const rows = await runShopifyql(admin, shopifyqlQueryString);
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
@@ -497,76 +474,6 @@ async function getOrdersForRange(admin, start, end) {
                     currencyCode
                   }
                   type
-                }
-              }
-
-              originalTotalPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              subtotalPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              totalShippingPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              totalTaxSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              totalDiscountsSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              currentTotalPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              currentSubtotalPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              currentShippingPriceSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              currentTotalTaxSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-
-              currentTotalDiscountsSet {
-                shopMoney {
-                  amount
-                  currencyCode
                 }
               }
 

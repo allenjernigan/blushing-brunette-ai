@@ -64,16 +64,6 @@ function money(value, currencyCode = "USD") {
   }).format(Number(value || 0));
 }
 
-function getMoneyAmount(object) {
-  return Number(object?.shopMoney?.amount || 0);
-}
-
-function sumMoney(orders, field) {
-  return orders.reduce((total, order) => {
-    return total + getMoneyAmount(order[field]);
-  }, 0);
-}
-
 function countUnitsSold(orders) {
   return orders.reduce((total, order) => {
     const orderUnits =
@@ -90,31 +80,6 @@ function countUnitsSold(orders) {
 
 function getOrderCurrentUnits(order) {
   return countUnitsSold([order]);
-}
-
-function calculateGrossProductSales(orders) {
-  return orders.reduce((orderTotal, order) => {
-    const lineItemTotal =
-      order.lineItems?.nodes?.reduce(
-        (lineTotal, lineItem) => {
-          const unitPrice = getMoneyAmount(
-            lineItem.originalUnitPriceSet,
-          );
-
-          const originalQuantity = Number(
-            lineItem.quantity || 0,
-          );
-
-          return (
-            lineTotal +
-            unitPrice * originalQuantity
-          );
-        },
-        0,
-      ) || 0;
-
-    return orderTotal + lineItemTotal;
-  }, 0);
 }
 
 function classifyShippingEligibility(order) {
@@ -492,27 +457,6 @@ function buildFinanceSummary(
   settings,
   shopifyMetrics,
 ) {
-  const orderSnapshotGrossSales = calculateGrossProductSales(orders);
-  const orderSnapshotDiscounts = sumMoney(
-    orders,
-    "totalDiscountsSet",
-  );
-  const originalNetProductSales = sumMoney(
-    orders,
-    "subtotalPriceSet",
-  );
-  const currentNetProductSales = sumMoney(
-    orders,
-    "currentSubtotalPriceSet",
-  );
-  const orderSnapshotReversalEstimate = Math.max(
-    0,
-    originalNetProductSales - currentNetProductSales,
-  );
-  const orderSnapshotShipping = sumMoney(
-    orders,
-    "currentShippingPriceSet",
-  );
   const profitSales = productCosts.isComplete
     ? shopifyMetrics.netSales
     : productCosts.knownCostSales;
@@ -547,16 +491,6 @@ function buildFinanceSummary(
 
   return {
     metrics,
-    orderSnapshotMetrics: {
-      grossSales: orderSnapshotGrossSales,
-      discounts: orderSnapshotDiscounts,
-      salesReversalEstimate: orderSnapshotReversalEstimate,
-      netSales: currentNetProductSales,
-      shippingCharges: orderSnapshotShipping,
-      taxes: sumMoney(orders, "currentTotalTaxSet"),
-      totalSales: sumMoney(orders, "currentTotalPriceSet"),
-      orders: orders.length,
-    },
     profitability: {
       ...productCosts,
       grossProfit,
@@ -716,7 +650,7 @@ const costIssueSummary = {
 };
 
   const orders = financeData.orders;
-  const { metrics, orderSnapshotMetrics, profitability } =
+  const { metrics, profitability } =
     buildFinanceSummary(
       orders,
       financeData.productCosts,
@@ -731,6 +665,8 @@ const costIssueSummary = {
         salesReversals: 0,
         netSales: 0,
         shippingCharges: 0,
+        shippingReversals: 0,
+        netShipping: 0,
         taxes: 0,
         duties: 0,
         additionalFees: 0,
@@ -758,6 +694,8 @@ const costIssueSummary = {
         salesReversals: shopify.salesReversals,
         netSales: shopify.netSales,
         shippingCharges: shopify.shippingCharges,
+        shippingReversals: shopify.shippingReversals,
+        netShipping: shopify.netShipping,
         taxes: shopify.taxes,
         productCogs: operational.profitability.knownCogs,
         grossProfit: operational.profitability.grossProfit,
@@ -768,31 +706,6 @@ const costIssueSummary = {
       };
     })
     .sort((left, right) => right.totalSales - left.totalSales);
-
-console.info("Finance reconciliation", {
-  period: {
-    start: financeData.period.start,
-    end: financeData.period.end,
-    timezone: financeData.timezone,
-  },
-  selectedChannels: financeData.selectedChannels,
-  shopifyql: {
-    grossSales: metrics.grossSales,
-    discounts: metrics.discounts,
-    salesReversals: metrics.salesReversals,
-    netSales: metrics.netSales,
-    shippingCharges: metrics.shippingCharges,
-    taxes: metrics.taxes,
-    totalSales: metrics.totalSales,
-  },
-  orderSnapshot: orderSnapshotMetrics,
-  differences: {
-    shippingCharges:
-      metrics.shippingCharges - orderSnapshotMetrics.shippingCharges,
-    salesReversals:
-      metrics.salesReversals + orderSnapshotMetrics.salesReversalEstimate,
-  },
-});
 
 return {
   selectedPeriod,
@@ -903,7 +816,7 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
       <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "960px" }}>
         <thead>
           <tr>
-            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Sales reversals", "Shipping charges", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
+            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Sales reversals", "Net shipping", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
               <th key={heading} scope="col" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #c9cccf" }}>
                 {heading}
               </th>
@@ -921,7 +834,7 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
               <td>{row.hasShopifyCoverage ? money(row.averageOrderValue, currencyCode) : "Unavailable"}</td>
               <td>{row.hasShopifyCoverage ? money(row.netSales, currencyCode) : "Unavailable"}</td>
               <td>{row.hasShopifyCoverage ? money(row.salesReversals, currencyCode) : "Unavailable"}</td>
-              <td>{row.hasShopifyCoverage ? money(row.shippingCharges, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.netShipping, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.productCogs, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.grossProfit, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.contributionProfit, currencyCode) : "Unavailable"}</td>
@@ -946,6 +859,8 @@ ChannelBreakdownTable.propTypes = {
       discounts: PropTypes.number.isRequired,
       salesReversals: PropTypes.number.isRequired,
       shippingCharges: PropTypes.number.isRequired,
+      shippingReversals: PropTypes.number.isRequired,
+      netShipping: PropTypes.number.isRequired,
       productCogs: PropTypes.number.isRequired,
       grossProfit: PropTypes.number.isRequired,
       contributionProfit: PropTypes.number.isRequired,
@@ -1336,9 +1251,9 @@ actionData.syncType === "orders" ? (
         />
 
         <MetricCard
-          label="Shipping Charges"
-          value={metrics.shippingCharges}
-          description="ShopifyQL shipping revenue charged to customers"
+          label="Net Shipping"
+          value={metrics.netShipping}
+          description="ShopifyQL shipping charges minus shipping reversals"
           currencyCode={currencyCode}
         />
 
@@ -1382,8 +1297,8 @@ actionData.syncType === "orders" ? (
           />
 
           <WaterfallRow
-            label="Shipping Charges"
-            value={metrics.shippingCharges}
+            label="Net Shipping"
+            value={metrics.netShipping}
             currencyCode={currencyCode}
             prefix="+ "
           />
@@ -1451,7 +1366,7 @@ actionData.syncType === "orders" ? (
           </s-paragraph>
 
           <s-paragraph>
-            ✅ Shipping Charges are customer revenue from ShopifyQL; Estimated Shipping Expense remains separate.
+            ✅ Net Shipping is ShopifyQL shipping charges minus shipping reversals; Estimated Shipping Expense remains separate.
           </s-paragraph>
 
           {Math.abs(waterfallDifference) > 0.01 ? (
