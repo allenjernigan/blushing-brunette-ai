@@ -6,13 +6,15 @@ application_url = "https://blushing-brunette-ai.onrender.com"
 embedded = true
 
 [build]
-automatically_update_urls_on_dev = true
+automatically_update_urls_on_dev = false
 
 [webhooks]
 api_version = "2026-07"
 
 [access_scopes]
 scopes = "read_orders,read_inventory,read_locations,write_metaobject_definitions,write_metaobjects,write_products"
+
+application_url = "https://blushing-brunette-ai.onrender.com"
 
 [auth]
 redirect_urls = [ "https://blushing-brunette-ai.onrender.com/api/auth" ]
