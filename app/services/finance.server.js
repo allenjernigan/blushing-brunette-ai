@@ -1,4 +1,8 @@
 import { DateTime } from "luxon";
+import {
+  buildProcessedAtRangeQuery,
+  isOrderWithinDateRange,
+} from "./financeDateRange";
 
 const STANDARD_SOURCE_NAMES = new Set([
   "web",
@@ -224,8 +228,7 @@ async function getOrdersForRange(admin, start, end) {
   let hasNextPage = true;
   let cursor = null;
 
-  const searchQuery =
-    `processed_at:>=${start} processed_at:<${end}`;
+  const searchQuery = buildProcessedAtRangeQuery(start, end);
 
   while (hasNextPage) {
     const response = await admin.graphql(
@@ -431,7 +434,9 @@ async function getOrdersForRange(admin, start, end) {
         order.lineItems.pageInfo,
       );
 
-      orders.push(order);
+      if (isOrderWithinDateRange(order, start, end)) {
+        orders.push(order);
+      }
     }
 
     hasNextPage = result.pageInfo.hasNextPage;

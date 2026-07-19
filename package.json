@@ -20,6 +20,7 @@
     "db:up": "docker compose up -d postgres",
     "db:down": "docker compose down",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",
+    "test": "node --test",
     "shopify": "shopify",
     "prisma": "prisma",
     "graphql-codegen": "graphql-codegen",
