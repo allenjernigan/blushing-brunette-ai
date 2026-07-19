@@ -8,6 +8,7 @@ import {
 } from "../app/services/finance.server.js";
 import {
   aggregateSalesMetrics,
+  buildFinanceSalesQuery,
   buildPeriodSalesQuery,
   calculateWaterfallTotal,
   normalizeSalesRow,
@@ -38,6 +39,17 @@ test("queries current ShopifyQL sales reversals and shipping metrics", () => {
   assert.match(query, /average_order_value/);
   assert.match(query, /SINCE 2026-07-01 UNTIL 2026-07-19/);
   assert.doesNotMatch(query, /\breturns\b/);
+});
+
+test("builds a dedicated absolute single-day ShopifyQL query", () => {
+  const query = buildFinanceSalesQuery({
+    key: "custom",
+    startDate: "2026-07-16",
+    endDate: "2026-07-16",
+  });
+
+  assert.match(query, /SINCE 2026-07-16 UNTIL 2026-07-16/);
+  assert.doesNotMatch(query, /2026-07-15|2026-07-17|T00:00|Z/);
 });
 
 test("preserves negative reversal signs without double subtraction", () => {
@@ -200,9 +212,9 @@ test("Finance GraphQL logging rethrows the original error", async () => {
     },
   ];
   const originalConsoleError = console.error;
-  let loggedArguments;
+  const loggedCalls = [];
   console.error = (...argumentsToLog) => {
-    loggedArguments = argumentsToLog;
+    loggedCalls.push(argumentsToLog);
   };
 
   try {
@@ -214,13 +226,24 @@ test("Finance GraphQL logging rethrows the original error", async () => {
       ),
       (error) => error === originalError,
     );
-    assert.equal(loggedArguments[0], "[Finance GraphQL request failed]");
-    assert.match(loggedArguments[1], /\n {2}"graphQLErrors": \[/);
-    assert.doesNotMatch(loggedArguments[1], /\[Array\]/);
     assert.equal(
-      JSON.parse(loggedArguments[1]).graphQLErrors[0].extensions.code,
+      loggedCalls[0][0],
+      "[Finance GraphQL errors expanded]",
+    );
+    assert.match(loggedCalls[0][1], /\n {2}\{/);
+    assert.doesNotMatch(loggedCalls[0][1], /\[Array\]/);
+    assert.equal(
+      JSON.parse(loggedCalls[0][1])[0].extensions.code,
       "ACCESS_DENIED",
     );
+    assert.deepEqual(loggedCalls[1], [
+      "[Finance GraphQL operation]",
+      "FinanceOrders",
+    ]);
+    assert.deepEqual(loggedCalls[2], [
+      "[Finance GraphQL wrapper message]",
+      "Network failure",
+    ]);
   } finally {
     console.error = originalConsoleError;
   }

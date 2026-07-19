@@ -20,6 +20,25 @@ export function buildPeriodSalesQuery(period) {
       ORDER BY total_sales DESC`;
 }
 
+export function buildSingleDaySalesQuery(date) {
+  return `FROM sales
+      SHOW ${SHOPIFY_SALES_METRICS.join(", ")}
+      GROUP BY sales_channel
+      SINCE ${date} UNTIL ${date}
+      ORDER BY total_sales DESC`;
+}
+
+export function buildFinanceSalesQuery(period) {
+  if (
+    period.key === "custom" &&
+    period.startDate === period.endDate
+  ) {
+    return buildSingleDaySalesQuery(period.startDate);
+  }
+
+  return buildPeriodSalesQuery(period);
+}
+
 export function normalizeSalesRow(row) {
   return {
     grossSales: Number(row.gross_sales || 0),

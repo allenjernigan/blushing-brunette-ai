@@ -6,6 +6,10 @@ const routeSource = await readFile(
   new URL("../app/routes/app.finance.jsx", import.meta.url),
   "utf8",
 );
+const requestSource = await readFile(
+  new URL("../app/services/financeRequest.js", import.meta.url),
+  "utf8",
+);
 
 test("renders every date preset as a visible button", () => {
   for (const label of [
@@ -27,8 +31,8 @@ test("custom date controls submit and retain start and end URL values", () => {
   assert.match(routeSource, /filterPeriod === "custom"/);
   assert.match(routeSource, /name="start" type="date" defaultValue=\{customStart\}/);
   assert.match(routeSource, /name="end" type="date" defaultValue=\{customEnd\}/);
-  assert.match(routeSource, /url\.searchParams\.get\("start"\)/);
-  assert.match(routeSource, /url\.searchParams\.get\("end"\)/);
+  assert.match(requestSource, /url\.searchParams\.get\("start"\)/);
+  assert.match(requestSource, /url\.searchParams\.get\("end"\)/);
 });
 
 test("keeps customer shipping revenue separate from estimated shipping expense", () => {

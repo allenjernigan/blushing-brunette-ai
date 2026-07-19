@@ -13,7 +13,7 @@ import {
 } from "./financeFilters.js";
 import {
   aggregateSalesMetrics,
-  buildPeriodSalesQuery,
+  buildFinanceSalesQuery,
   normalizeSalesRow,
 } from "./financeShopifyql.js";
 
@@ -326,16 +326,7 @@ export function parseShopifyqlResult(json) {
   return result.tableData.rows || [];
 }
 
-async function runShopifyql(admin, shopifyqlQueryString, dateInputs) {
-  console.error(
-    "[Finance ShopifyQL query]",
-    shopifyqlQueryString,
-  );
-  console.error(
-    "[Finance ShopifyQL date inputs]",
-    JSON.stringify(dateInputs, null, 2),
-  );
-
+async function runShopifyql(admin, shopifyqlQueryString) {
   try {
     const response = await executeFinanceGraphql(
       admin,
@@ -385,12 +376,7 @@ async function getSalesChannels(admin) {
       GROUP BY sales_channel, is_pos_sale
       SINCE 2000-01-01 UNTIL today
       ORDER BY total_sales DESC`;
-  const rows = await runShopifyql(admin, shopifyqlQueryString, {
-    period: "channel-discovery",
-    start: "2000-01-01",
-    end: "today",
-    dateClause: "SINCE 2000-01-01 UNTIL today",
-  });
+  const rows = await runShopifyql(admin, shopifyqlQueryString);
 
   const channelsByKey = new Map();
 
@@ -415,13 +401,8 @@ async function getSalesChannels(admin) {
 }
 
 async function getPeriodChannelSales(admin, period) {
-  const shopifyqlQueryString = buildPeriodSalesQuery(period);
-  const rows = await runShopifyql(admin, shopifyqlQueryString, {
-    period: period.key,
-    start: period.startDate,
-    end: period.endDate,
-    dateClause: `SINCE ${period.startDate} UNTIL ${period.endDate}`,
-  });
+  const shopifyqlQueryString = buildFinanceSalesQuery(period);
+  const rows = await runShopifyql(admin, shopifyqlQueryString);
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
