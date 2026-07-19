@@ -77,6 +77,14 @@ test("builds every preset in the store timezone", () => {
   });
   assert.equal(lastMonth.start, "2025-12-01T05:00:00.000Z");
   assert.equal(lastMonth.end, "2026-01-01T05:00:00.000Z");
+
+  const monthToDate = getFinanceDateRange({
+    periodKey: "month-to-date",
+    timezone: "America/New_York",
+    now,
+  });
+  assert.equal(monthToDate.startDate, "2026-07-01");
+  assert.equal(monthToDate.endDate, "2026-07-19");
 });
 
 test("treats a custom end date as inclusive across DST", () => {

@@ -23,6 +23,7 @@ import {
   getActiveChannelPreset,
   getPresetChannels,
 } from "../services/financeFilters";
+import { calculateWaterfallTotal } from "../services/financeShopifyql";
 import prisma from "../db.server";
 
 const PERIODS = [
@@ -485,10 +486,17 @@ function calculateProcessingFees(orders, settings) {
   };
 }
 
-function buildFinanceSummary(orders, productCosts, settings) {
-  const grossProductSales =
-    calculateGrossProductSales(orders);
-  const discounts = sumMoney(orders, "totalDiscountsSet");
+function buildFinanceSummary(
+  orders,
+  productCosts,
+  settings,
+  shopifyMetrics,
+) {
+  const orderSnapshotGrossSales = calculateGrossProductSales(orders);
+  const orderSnapshotDiscounts = sumMoney(
+    orders,
+    "totalDiscountsSet",
+  );
   const originalNetProductSales = sumMoney(
     orders,
     "subtotalPriceSet",
@@ -497,8 +505,16 @@ function buildFinanceSummary(orders, productCosts, settings) {
     orders,
     "currentSubtotalPriceSet",
   );
+  const orderSnapshotReversalEstimate = Math.max(
+    0,
+    originalNetProductSales - currentNetProductSales,
+  );
+  const orderSnapshotShipping = sumMoney(
+    orders,
+    "currentShippingPriceSet",
+  );
   const profitSales = productCosts.isComplete
-    ? currentNetProductSales
+    ? shopifyMetrics.netSales
     : productCosts.knownCostSales;
   const grossProfit = profitSales - productCosts.knownCogs;
   const grossMargin =
@@ -517,38 +533,30 @@ function buildFinanceSummary(orders, productCosts, settings) {
     grossProfit -
     estimatedShipping.expense -
     processingFees.totalFees;
-  // Net product sales is the business-defined denominator for contribution
-  // margin, even when the contribution numerator is marked incomplete.
+  // ShopifyQL Net Sales is the revenue base and contribution-margin
+  // denominator. Customer shipping charges are revenue and are not subtracted.
   const contributionMargin =
-    currentNetProductSales > 0
-      ? (contributionProfit / currentNetProductSales) * 100
+    shopifyMetrics.netSales > 0
+      ? (contributionProfit / shopifyMetrics.netSales) * 100
       : 0;
 
   const metrics = {
-    orders: orders.length,
+    ...shopifyMetrics,
     unitsSold: countUnitsSold(orders),
-    grossProductSales,
-    discounts,
-    returnsAndEdits: Math.max(
-      0,
-      originalNetProductSales - currentNetProductSales,
-    ),
-    netProductSales: currentNetProductSales,
-    shippingCollected: sumMoney(
-      orders,
-      "currentShippingPriceSet",
-    ),
-    taxes: sumMoney(orders, "currentTotalTaxSet"),
-    totalSales: sumMoney(orders, "currentTotalPriceSet"),
   };
-
-  metrics.averageOrderValue =
-    metrics.orders > 0
-      ? metrics.totalSales / metrics.orders
-      : 0;
 
   return {
     metrics,
+    orderSnapshotMetrics: {
+      grossSales: orderSnapshotGrossSales,
+      discounts: orderSnapshotDiscounts,
+      salesReversalEstimate: orderSnapshotReversalEstimate,
+      netSales: currentNetProductSales,
+      shippingCharges: orderSnapshotShipping,
+      taxes: sumMoney(orders, "currentTotalTaxSet"),
+      totalSales: sumMoney(orders, "currentTotalPriceSet"),
+      orders: orders.length,
+    },
     profitability: {
       ...productCosts,
       grossProfit,
@@ -717,45 +725,83 @@ const costIssueSummary = {
 };
 
   const orders = financeData.orders;
-  const { metrics, profitability } =
+  const { metrics, orderSnapshotMetrics, profitability } =
     buildFinanceSummary(
       orders,
       financeData.productCosts,
       savedSettings,
+      financeData.shopifyMetrics,
     );
   const channelBreakdown = financeData.channelBreakdown
     .map((entry) => {
+      const shopify = entry.shopify || {
+        grossSales: 0,
+        discounts: 0,
+        salesReversals: 0,
+        netSales: 0,
+        shippingCharges: 0,
+        taxes: 0,
+        duties: 0,
+        additionalFees: 0,
+        totalSales: 0,
+        orders: 0,
+        averageOrderValue: 0,
+      };
       const operational = buildFinanceSummary(
         entry.orders,
         entry.productCosts,
         savedSettings,
+        shopify,
       );
-      const totalSales =
-        entry.shopify?.totalSales ?? operational.metrics.totalSales;
-      const orderCount =
-        entry.shopify?.orders ?? operational.metrics.orders;
+      const totalSales = shopify.totalSales;
+      const orderCount = shopify.orders;
 
       return {
         key: entry.channel.key,
         label: entry.channel.label,
         totalSales,
         orders: orderCount,
-        averageOrderValue:
-          orderCount > 0 ? totalSales / orderCount : 0,
-        netSales:
-          entry.shopify?.netSales ??
-          operational.metrics.netProductSales,
-        returns:
-          entry.shopify?.returns ??
-          -operational.metrics.returnsAndEdits,
+        averageOrderValue: shopify.averageOrderValue,
+        grossSales: shopify.grossSales,
+        discounts: shopify.discounts,
+        salesReversals: shopify.salesReversals,
+        netSales: shopify.netSales,
+        shippingCharges: shopify.shippingCharges,
+        taxes: shopify.taxes,
         productCogs: operational.profitability.knownCogs,
         grossProfit: operational.profitability.grossProfit,
         contributionProfit:
           operational.profitability.contributionProfit,
         hasOrderCoverage: entry.orders.length > 0,
+        hasShopifyCoverage: entry.shopify !== null,
       };
     })
     .sort((left, right) => right.totalSales - left.totalSales);
+
+console.info("Finance reconciliation", {
+  period: {
+    start: financeData.period.start,
+    end: financeData.period.end,
+    timezone: financeData.timezone,
+  },
+  selectedChannels: financeData.selectedChannels,
+  shopifyql: {
+    grossSales: metrics.grossSales,
+    discounts: metrics.discounts,
+    salesReversals: metrics.salesReversals,
+    netSales: metrics.netSales,
+    shippingCharges: metrics.shippingCharges,
+    taxes: metrics.taxes,
+    totalSales: metrics.totalSales,
+  },
+  orderSnapshot: orderSnapshotMetrics,
+  differences: {
+    shippingCharges:
+      metrics.shippingCharges - orderSnapshotMetrics.shippingCharges,
+    salesReversals:
+      metrics.salesReversals + orderSnapshotMetrics.salesReversalEstimate,
+  },
+});
 
 return {
   selectedPeriod,
@@ -866,7 +912,7 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
       <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "960px" }}>
         <thead>
           <tr>
-            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Returns", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
+            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Sales reversals", "Shipping charges", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
               <th key={heading} scope="col" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #c9cccf" }}>
                 {heading}
               </th>
@@ -879,11 +925,12 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
               <th scope="row" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #e1e3e5" }}>
                 {row.label}
               </th>
-              <td>{money(row.totalSales, currencyCode)}</td>
-              <td>{row.orders}</td>
-              <td>{money(row.averageOrderValue, currencyCode)}</td>
-              <td>{money(row.netSales, currencyCode)}</td>
-              <td>{money(row.returns, currencyCode)}</td>
+              <td>{row.hasShopifyCoverage ? money(row.totalSales, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? row.orders : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.averageOrderValue, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.netSales, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.salesReversals, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.shippingCharges, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.productCogs, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.grossProfit, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.contributionProfit, currencyCode) : "Unavailable"}</td>
@@ -904,11 +951,15 @@ ChannelBreakdownTable.propTypes = {
       orders: PropTypes.number.isRequired,
       averageOrderValue: PropTypes.number.isRequired,
       netSales: PropTypes.number.isRequired,
-      returns: PropTypes.number.isRequired,
+      grossSales: PropTypes.number.isRequired,
+      discounts: PropTypes.number.isRequired,
+      salesReversals: PropTypes.number.isRequired,
+      shippingCharges: PropTypes.number.isRequired,
       productCogs: PropTypes.number.isRequired,
       grossProfit: PropTypes.number.isRequired,
       contributionProfit: PropTypes.number.isRequired,
       hasOrderCoverage: PropTypes.bool.isRequired,
+      hasShopifyCoverage: PropTypes.bool.isRequired,
     }),
   ).isRequired,
   currencyCode: PropTypes.string.isRequired,
@@ -958,6 +1009,8 @@ const isSyncingOrders =
     channelSelection,
     channels,
   );
+  const waterfallDifference =
+    calculateWaterfallTotal(metrics) - metrics.totalSales;
 
   function toggleChannel(channelKey) {
     setChannelSelection((current) =>
@@ -1125,33 +1178,40 @@ actionData.syncType === "orders" ? (
       <s-section heading="Finance Filters">
         <Form method="get">
           <div style={{ display: "grid", gap: "16px" }}>
-            <label>
-              <span style={{ display: "block", fontWeight: 600 }}>
-                Date range
-              </span>
-              <select
-                name="period"
-                value={filterPeriod}
-                onChange={(event) => setFilterPeriod(event.target.value)}
-                style={{ marginTop: "6px", padding: "8px 12px" }}
-              >
+            <fieldset style={{ border: 0, margin: 0, padding: 0 }}>
+              <legend style={{ fontWeight: 600 }}>Date range</legend>
+              <input type="hidden" name="period" value={filterPeriod} />
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "8px", marginTop: "8px" }}>
                 {PERIODS.map((option) => (
-                  <option key={option.key} value={option.key}>
+                  <button
+                    key={option.key}
+                    type="button"
+                    onClick={() => setFilterPeriod(option.key)}
+                    aria-pressed={filterPeriod === option.key}
+                    style={{
+                      padding: "8px 12px",
+                      borderRadius: "8px",
+                      border: "1px solid #8c9196",
+                      background: filterPeriod === option.key ? "#202223" : "#ffffff",
+                      color: filterPeriod === option.key ? "#ffffff" : "#202223",
+                      fontWeight: filterPeriod === option.key ? 600 : 400,
+                    }}
+                  >
                     {option.label}
-                  </option>
+                  </button>
                 ))}
-              </select>
-            </label>
+              </div>
+            </fieldset>
 
             {filterPeriod === "custom" ? (
               <div style={{ display: "flex", flexWrap: "wrap", gap: "12px" }}>
                 <label>
                   Start date
-                  <input name="start" type="date" defaultValue={customStart} />
+                  <input key={`start-${customStart}`} name="start" type="date" defaultValue={customStart} />
                 </label>
                 <label>
                   End date
-                  <input name="end" type="date" defaultValue={customEnd} />
+                  <input key={`end-${customEnd}`} name="end" type="date" defaultValue={customEnd} />
                 </label>
               </div>
             ) : null}
@@ -1227,14 +1287,14 @@ actionData.syncType === "orders" ? (
         <MetricCard
           label="Total Sales"
           value={metrics.totalSales}
-          description="Products, shipping and tax"
+          description="ShopifyQL products, shipping, taxes, duties, and fees"
           currencyCode={currencyCode}
         />
 
         <MetricCard
-          label="Net Product Sales"
-          value={metrics.netProductSales}
-          description="Products after discounts and returns"
+          label="Net Sales"
+          value={metrics.netSales}
+          description="ShopifyQL gross sales, discounts, and sales reversals"
           currencyCode={currencyCode}
         />
 
@@ -1262,35 +1322,35 @@ actionData.syncType === "orders" ? (
         />
 
         <MetricCard
-          label="Gross Product Sales"
-          value={metrics.grossProductSales}
-          description="Original item prices before discounts"
+          label="Gross Sales"
+          value={metrics.grossSales}
+          description="ShopifyQL sales before discounts and reversals"
           currencyCode={currencyCode}
         />
 
         <MetricCard
           label="Discounts"
           value={metrics.discounts}
-          description="Discounts applied to selected orders"
+          description="ShopifyQL discount value with its reported sign"
           currencyCode={currencyCode}
         />
 
         <MetricCard
-          label="Returns / Order Edits"
-          value={metrics.returnsAndEdits}
-          description="Reduction from original to current subtotal"
+          label="Sales Reversals"
+          value={metrics.salesReversals}
+          description="Refunds, returns, cancellations, and order edits"
           currencyCode={currencyCode}
         />
 
         <MetricCard
-          label="Shipping Collected"
-          value={metrics.shippingCollected}
-          description="Shipping charged to customers"
+          label="Shipping Charges"
+          value={metrics.shippingCharges}
+          description="ShopifyQL shipping revenue charged to customers"
           currencyCode={currencyCode}
         />
 
         <MetricCard
-          label="Taxes Collected"
+          label="Taxes"
           value={metrics.taxes}
           description="Taxes are not business revenue"
           currencyCode={currencyCode}
@@ -1304,8 +1364,8 @@ actionData.syncType === "orders" ? (
           borderRadius="base"
         >
           <WaterfallRow
-            label="Gross Product Sales"
-            value={metrics.grossProductSales}
+            label="Gross Sales"
+            value={metrics.grossSales}
             currencyCode={currencyCode}
           />
 
@@ -1313,36 +1373,52 @@ actionData.syncType === "orders" ? (
             label="Discounts"
             value={metrics.discounts}
             currencyCode={currencyCode}
-            prefix="− "
           />
 
           <WaterfallRow
-            label="Returns / Order Edits"
-            value={metrics.returnsAndEdits}
+            label="Sales Reversals"
+            value={metrics.salesReversals}
             currencyCode={currencyCode}
-            prefix="− "
           />
 
           <WaterfallRow
-            label="Net Product Sales"
-            value={metrics.netProductSales}
+            label="= Net Sales"
+            value={metrics.netSales}
             currencyCode={currencyCode}
             strong
           />
 
           <WaterfallRow
-            label="Shipping Collected"
-            value={metrics.shippingCollected}
+            label="Shipping Charges"
+            value={metrics.shippingCharges}
             currencyCode={currencyCode}
             prefix="+ "
           />
 
           <WaterfallRow
-            label="Taxes Collected"
+            label="Taxes"
             value={metrics.taxes}
             currencyCode={currencyCode}
             prefix="+ "
           />
+
+          {metrics.duties !== 0 ? (
+            <WaterfallRow
+              label="Duties"
+              value={metrics.duties}
+              currencyCode={currencyCode}
+              prefix="+ "
+            />
+          ) : null}
+
+          {metrics.additionalFees !== 0 ? (
+            <WaterfallRow
+              label="Additional Fees"
+              value={metrics.additionalFees}
+              currencyCode={currencyCode}
+              prefix="+ "
+            />
+          ) : null}
 
           <div
             style={{
@@ -1369,14 +1445,11 @@ actionData.syncType === "orders" ? (
       <s-section heading="Data Quality">
         <s-stack direction="block" gap="base">
           <s-paragraph>
-            ✅ Order totals come directly from
-            Shopify.
+            ✅ Displayed sales metrics come directly from ShopifyQL.
           </s-paragraph>
 
           <s-paragraph>
-            ✅ Gross sales, discounts, current net
-            product sales, shipping and taxes are
-            displayed separately.
+            ✅ Sales reversals preserve ShopifyQL&apos;s negative sign and are not double-subtracted.
           </s-paragraph>
 
           <s-paragraph>
@@ -1385,12 +1458,18 @@ actionData.syncType === "orders" ? (
           </s-paragraph>
 
           <s-paragraph>
-            ⚠ Returns currently reflect changes to
-            orders originally processed during the
-            selected period. A refund issued today
-            against an older order is not yet assigned
-            to today.
+            ✅ Shipping Charges are customer revenue from ShopifyQL; Estimated Shipping Expense remains separate.
           </s-paragraph>
+
+          {Math.abs(waterfallDifference) > 0.01 ? (
+            <s-paragraph>
+              ⚠ ShopifyQL waterfall components differ from Total Sales by {money(waterfallDifference, currencyCode)}.
+            </s-paragraph>
+          ) : (
+            <s-paragraph>
+              ✅ ShopifyQL waterfall components reconcile to Total Sales.
+            </s-paragraph>
+          )}
 
           <s-paragraph>
             ✅ Product COGS uses each sold variant&apos;s
@@ -1873,7 +1952,7 @@ actionData.syncType === "orders" ? (
           value={profitability.grossProfit}
           description={
             profitability.isComplete
-              ? "Net product sales minus product COGS"
+              ? "ShopifyQL Net Sales minus product COGS"
               : "Known-cost item sales minus known product COGS"
           }
           currencyCode={currencyCode}
@@ -1886,7 +1965,7 @@ actionData.syncType === "orders" ? (
           )}%`}
           description={
             profitability.isComplete
-              ? "Gross profit divided by net product sales"
+              ? "Gross profit divided by ShopifyQL Net Sales"
               : "Based only on sold items with known costs"
           }
           currencyCode={currencyCode}
@@ -1899,7 +1978,7 @@ actionData.syncType === "orders" ? (
           description={[
             profitability.estimatedShipping
               .ecommerceShipments,
-            " ecommerce × ",
+            " non-POS × ",
             money(
               profitability.estimatedShipping
                 .ecommerceCost,
@@ -1985,7 +2064,7 @@ actionData.syncType === "orders" ? (
               : "Known Contribution Profit"
           }
           value={profitability.contributionProfit}
-          description="Net product sales minus COGS, estimated shipping, and total processing fees"
+          description="ShopifyQL Net Sales minus COGS, estimated shipping expense, and total processing fees"
           currencyCode={currencyCode}
         />
 
@@ -1997,8 +2076,8 @@ actionData.syncType === "orders" ? (
           }
           description={
             profitability.isComplete
-              ? "Contribution profit divided by net product sales"
-              : "Incomplete contribution divided by net product sales"
+              ? "ShopifyQL Net Sales minus COGS, estimated shipping expense, and processing fees"
+              : "Incomplete contribution divided by ShopifyQL Net Sales"
           }
           currencyCode={currencyCode}
           isMoney={false}

@@ -11,6 +11,11 @@ import {
   normalizeOrderChannel,
   normalizeShopifyChannel,
 } from "./financeFilters.js";
+import {
+  aggregateSalesMetrics,
+  buildPeriodSalesQuery,
+  normalizeSalesRow,
+} from "./financeShopifyql.js";
 
 const STANDARD_SOURCE_NAMES = new Set([
   "web",
@@ -269,19 +274,12 @@ async function getSalesChannels(admin) {
 async function getPeriodChannelSales(admin, period) {
   const rows = await runShopifyql(
     admin,
-    `FROM sales
-      SHOW total_sales, orders, net_sales, returns
-      GROUP BY sales_channel
-      SINCE ${period.startDate} UNTIL ${period.endDate}
-      ORDER BY total_sales DESC`,
+    buildPeriodSalesQuery(period),
   );
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
-    totalSales: Number(row.total_sales || 0),
-    orders: Number(row.orders || 0),
-    netSales: Number(row.net_sales || 0),
-    returns: Number(row.returns || 0),
+    ...normalizeSalesRow(row),
   }));
 }
 
@@ -709,6 +707,10 @@ export async function getFinanceSales(
     productCosts: calculateProductCosts(orders),
     channels,
     selectedChannels,
+    shopifyMetrics: aggregateSalesMetrics(
+      shopifyChannelSales,
+      selectedChannels,
+    ),
     channelBreakdown,
     dateError,
     unexpectedSourceNames: getUnexpectedSourceNames(allOrders),
