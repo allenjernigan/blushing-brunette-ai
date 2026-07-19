@@ -4,7 +4,6 @@ export const SHOPIFY_SALES_METRICS = [
   "sales_reversals",
   "net_sales",
   "shipping_charges",
-  "shipping_reversals",
   "taxes",
   "duties",
   "additional_fees",
@@ -28,10 +27,6 @@ export function normalizeSalesRow(row) {
     salesReversals: Number(row.sales_reversals || 0),
     netSales: Number(row.net_sales || 0),
     shippingCharges: Number(row.shipping_charges || 0),
-    shippingReversals: Number(row.shipping_reversals || 0),
-    netShipping:
-      Number(row.shipping_charges || 0) -
-      Number(row.shipping_reversals || 0),
     taxes: Number(row.taxes || 0),
     duties: Number(row.duties || 0),
     additionalFees: Number(row.additional_fees || 0),
@@ -54,8 +49,6 @@ export function aggregateSalesMetrics(summaries, selectedChannels) {
           "salesReversals",
           "netSales",
           "shippingCharges",
-          "shippingReversals",
-          "netShipping",
           "taxes",
           "duties",
           "additionalFees",
@@ -73,8 +66,6 @@ export function aggregateSalesMetrics(summaries, selectedChannels) {
         salesReversals: 0,
         netSales: 0,
         shippingCharges: 0,
-        shippingReversals: 0,
-        netShipping: 0,
         taxes: 0,
         duties: 0,
         additionalFees: 0,
@@ -101,7 +92,7 @@ export function calculateWaterfallTotal(metrics) {
     metrics.grossSales +
     metrics.discounts +
     metrics.salesReversals +
-    metrics.netShipping +
+    metrics.shippingCharges +
     metrics.taxes +
     metrics.duties +
     metrics.additionalFees

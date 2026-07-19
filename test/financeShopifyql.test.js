@@ -35,7 +35,7 @@ test("queries current ShopifyQL sales reversals and shipping metrics", () => {
 
   assert.match(query, /sales_reversals/);
   assert.match(query, /shipping_charges/);
-  assert.match(query, /shipping_reversals/);
+  assert.doesNotMatch(query, /shipping_reversals/);
   assert.match(query, /average_order_value/);
   assert.match(query, /SINCE 2026-07-01 UNTIL 2026-07-19/);
   assert.doesNotMatch(query, /\breturns\b/);
@@ -48,7 +48,6 @@ test("preserves negative reversal signs without double subtraction", () => {
     sales_reversals: -20,
     net_sales: 70,
     shipping_charges: 8,
-    shipping_reversals: 3,
     taxes: 5,
     duties: 1,
     additional_fees: 2,
@@ -59,9 +58,7 @@ test("preserves negative reversal signs without double subtraction", () => {
 
   assert.equal(metrics.salesReversals, -20);
   assert.equal(metrics.shippingCharges, 8);
-  assert.equal(metrics.shippingReversals, 3);
-  assert.equal(metrics.netShipping, 5);
-  assert.equal(calculateWaterfallTotal(metrics), 83);
+  assert.equal(calculateWaterfallTotal(metrics), 86);
 });
 
 test("aggregates only selected ShopifyQL channel rows", () => {
@@ -74,7 +71,6 @@ test("aggregates only selected ShopifyQL channel rows", () => {
         sales_reversals: -5,
         net_sales: 85,
         shipping_charges: 10,
-        shipping_reversals: 2,
         taxes: 5,
         total_sales: 100,
         orders: 2,
@@ -98,8 +94,6 @@ test("aggregates only selected ShopifyQL channel rows", () => {
   assert.equal(selected.orders, 2);
   assert.equal(selected.averageOrderValue, 50);
   assert.equal(selected.shippingCharges, 10);
-  assert.equal(selected.shippingReversals, 2);
-  assert.equal(selected.netShipping, 8);
 });
 
 test("surfaces GraphQL, parse, and missing table errors", () => {

@@ -665,8 +665,6 @@ const costIssueSummary = {
         salesReversals: 0,
         netSales: 0,
         shippingCharges: 0,
-        shippingReversals: 0,
-        netShipping: 0,
         taxes: 0,
         duties: 0,
         additionalFees: 0,
@@ -694,8 +692,6 @@ const costIssueSummary = {
         salesReversals: shopify.salesReversals,
         netSales: shopify.netSales,
         shippingCharges: shopify.shippingCharges,
-        shippingReversals: shopify.shippingReversals,
-        netShipping: shopify.netShipping,
         taxes: shopify.taxes,
         productCogs: operational.profitability.knownCogs,
         grossProfit: operational.profitability.grossProfit,
@@ -816,7 +812,7 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
       <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "960px" }}>
         <thead>
           <tr>
-            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Sales reversals", "Net shipping", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
+            {["Channel", "Total sales", "Orders", "AOV", "Net sales", "Sales reversals", "Shipping charges", "Product COGS", "Gross profit", "Contribution profit"].map((heading) => (
               <th key={heading} scope="col" style={{ padding: "10px", textAlign: "left", borderBottom: "1px solid #c9cccf" }}>
                 {heading}
               </th>
@@ -834,7 +830,7 @@ function ChannelBreakdownTable({ rows, currencyCode }) {
               <td>{row.hasShopifyCoverage ? money(row.averageOrderValue, currencyCode) : "Unavailable"}</td>
               <td>{row.hasShopifyCoverage ? money(row.netSales, currencyCode) : "Unavailable"}</td>
               <td>{row.hasShopifyCoverage ? money(row.salesReversals, currencyCode) : "Unavailable"}</td>
-              <td>{row.hasShopifyCoverage ? money(row.netShipping, currencyCode) : "Unavailable"}</td>
+              <td>{row.hasShopifyCoverage ? money(row.shippingCharges, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.productCogs, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.grossProfit, currencyCode) : "Unavailable"}</td>
               <td>{row.hasOrderCoverage ? money(row.contributionProfit, currencyCode) : "Unavailable"}</td>
@@ -859,8 +855,6 @@ ChannelBreakdownTable.propTypes = {
       discounts: PropTypes.number.isRequired,
       salesReversals: PropTypes.number.isRequired,
       shippingCharges: PropTypes.number.isRequired,
-      shippingReversals: PropTypes.number.isRequired,
-      netShipping: PropTypes.number.isRequired,
       productCogs: PropTypes.number.isRequired,
       grossProfit: PropTypes.number.isRequired,
       contributionProfit: PropTypes.number.isRequired,
@@ -1251,9 +1245,9 @@ actionData.syncType === "orders" ? (
         />
 
         <MetricCard
-          label="Net Shipping"
-          value={metrics.netShipping}
-          description="ShopifyQL shipping charges minus shipping reversals"
+          label="Shipping Charges"
+          value={metrics.shippingCharges}
+          description="ShopifyQL shipping revenue charged to customers"
           currencyCode={currencyCode}
         />
 
@@ -1297,8 +1291,8 @@ actionData.syncType === "orders" ? (
           />
 
           <WaterfallRow
-            label="Net Shipping"
-            value={metrics.netShipping}
+            label="Shipping Charges"
+            value={metrics.shippingCharges}
             currencyCode={currencyCode}
             prefix="+ "
           />
@@ -1366,7 +1360,7 @@ actionData.syncType === "orders" ? (
           </s-paragraph>
 
           <s-paragraph>
-            ✅ Net Shipping is ShopifyQL shipping charges minus shipping reversals; Estimated Shipping Expense remains separate.
+            ✅ Shipping Charges are customer revenue from ShopifyQL; Estimated Shipping Expense remains separate.
           </s-paragraph>
 
           {Math.abs(waterfallDifference) > 0.01 ? (
