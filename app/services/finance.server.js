@@ -107,13 +107,25 @@ export async function executeFinanceGraphql(
   try {
     return await admin.graphql(query, options);
   } catch (error) {
+    const expandedGraphQLErrors = Array.isArray(error?.graphQLErrors)
+      ? error.graphQLErrors.map((graphQLError) => ({
+          message: graphQLError?.message ?? null,
+          path: graphQLError?.path ?? null,
+          locations: graphQLError?.locations ?? null,
+          extensions: graphQLError?.extensions
+            ? JSON.parse(JSON.stringify(graphQLError.extensions))
+            : null,
+        }))
+      : [];
+
     console.error(
-      "[Finance GraphQL request failed]",
-      JSON.stringify(
-        getSafeGraphqlErrorDetails(error, operationName),
-        null,
-        2,
-      ),
+      "[Finance GraphQL errors expanded]",
+      JSON.stringify(expandedGraphQLErrors, null, 2),
+    );
+    console.error("[Finance GraphQL operation]", operationName);
+    console.error(
+      "[Finance GraphQL wrapper message]",
+      error?.message,
     );
     throw error;
   }
