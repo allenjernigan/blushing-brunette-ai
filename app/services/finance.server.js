@@ -23,6 +23,72 @@ const STANDARD_SOURCE_NAMES = new Set([
   "shopify_draft_order",
 ]);
 
+function sanitizeErrorText(value) {
+  return String(value)
+    .replace(/https?:\/\/\S+/gi, "[REDACTED_URL]")
+    .replace(
+      /(access[_ -]?token|id_token|hmac|session|database_url)\s*[:=]\s*\S+/gi,
+      "$1=[REDACTED]",
+    );
+}
+
+function sanitizeGraphqlErrors(errors) {
+  if (!Array.isArray(errors)) return null;
+
+  return errors.map((error) => ({
+    message: sanitizeErrorText(error?.message || error),
+    path: error?.path || null,
+    code: error?.extensions?.code || null,
+  }));
+}
+
+function sanitizeNetworkError(networkError) {
+  if (!networkError) return null;
+  if (typeof networkError === "string") {
+    return sanitizeErrorText(networkError);
+  }
+
+  return {
+    name: networkError.name || null,
+    message: sanitizeErrorText(networkError.message || networkError),
+    status: networkError.status || networkError.statusCode || null,
+  };
+}
+
+export function getSafeGraphqlErrorDetails(error, operationName) {
+  const safeOperationName = String(operationName).match(
+    /^[A-Za-z_][A-Za-z0-9_]*/,
+  )?.[0];
+
+  return {
+    operationName: safeOperationName || "UnknownFinanceOperation",
+    message: sanitizeErrorText(error?.message || error),
+    graphQLErrors: sanitizeGraphqlErrors(error?.graphQLErrors),
+    networkError: sanitizeNetworkError(error?.networkError),
+    response: {
+      status: error?.response?.status ?? null,
+      errors: sanitizeGraphqlErrors(error?.response?.errors),
+    },
+  };
+}
+
+export async function executeFinanceGraphql(
+  admin,
+  operationName,
+  query,
+  options,
+) {
+  try {
+    return await admin.graphql(query, options);
+  } catch (error) {
+    console.error(
+      "Finance GraphQL request failed",
+      getSafeGraphqlErrorDetails(error, operationName),
+    );
+    throw error;
+  }
+}
+
 export function normalizeSourceName(sourceName) {
   return String(sourceName || "")
     .trim()
@@ -165,7 +231,9 @@ function calculateProductCosts(orders) {
 }
 
 async function getShopSettings(admin) {
-  const response = await admin.graphql(
+  const response = await executeFinanceGraphql(
+    admin,
+    "FinanceShopSettings",
     `#graphql
       query FinanceShopSettings {
         shop {
@@ -217,7 +285,9 @@ export function parseShopifyqlResult(json) {
 }
 
 async function runShopifyql(admin, query) {
-  const response = await admin.graphql(
+  const response = await executeFinanceGraphql(
+    admin,
+    "FinanceShopifyql",
     `#graphql
       query FinanceShopifyql($query: String!) {
         shopifyqlQuery(query: $query) {
@@ -291,7 +361,9 @@ async function getOrdersForRange(admin, start, end) {
   const searchQuery = buildProcessedAtRangeQuery(start, end);
 
   while (hasNextPage) {
-    const response = await admin.graphql(
+    const response = await executeFinanceGraphql(
+      admin,
+      "FinanceOrders",
       `#graphql
         query FinanceOrders(
           $query: String!
@@ -521,7 +593,9 @@ async function getRemainingOrderLineItems(
   let cursor = initialPageInfo.endCursor;
 
   while (hasNextPage) {
-    const response = await admin.graphql(
+    const response = await executeFinanceGraphql(
+      admin,
+      "FinanceOrderLineItems",
       `#graphql
         query FinanceOrderLineItems(
           $orderId: ID!

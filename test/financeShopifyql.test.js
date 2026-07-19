@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseShopifyqlResult } from "../app/services/finance.server.js";
+import {
+  executeFinanceGraphql,
+  getSafeGraphqlErrorDetails,
+  parseShopifyqlResult,
+} from "../app/services/finance.server.js";
 import {
   aggregateSalesMetrics,
   buildPeriodSalesQuery,
@@ -115,4 +119,78 @@ test("surfaces GraphQL, parse, and missing table errors", () => {
       }),
     /no report table/i,
   );
+});
+
+test("Finance GraphQL logging exposes only approved failure details", () => {
+  const details = getSafeGraphqlErrorDetails(
+    {
+      message:
+        "Request failed at https://store.example/private access_token=secret-token",
+      accessToken: "secret-token",
+      session: { idToken: "secret-id-token" },
+      graphQLErrors: [
+        {
+          message: "Access denied",
+          path: ["shopifyqlQuery"],
+          extensions: { code: "ACCESS_DENIED", hmac: "secret-hmac" },
+        },
+      ],
+      networkError: {
+        name: "NetworkError",
+        message: "Connection failed",
+        statusCode: 502,
+        url: "https://store.example/admin/api?token=secret",
+      },
+      response: {
+        status: 502,
+        requestUrl: "https://store.example/private",
+        errors: [{ message: "Bad gateway" }],
+      },
+    },
+    "FinanceShopifyql",
+  );
+
+  assert.deepEqual(details, {
+    operationName: "FinanceShopifyql",
+    message: "Request failed at [REDACTED_URL] access_token=[REDACTED]",
+    graphQLErrors: [
+      {
+        message: "Access denied",
+        path: ["shopifyqlQuery"],
+        code: "ACCESS_DENIED",
+      },
+    ],
+    networkError: {
+      name: "NetworkError",
+      message: "Connection failed",
+      status: 502,
+    },
+    response: {
+      status: 502,
+      errors: [{ message: "Bad gateway", path: null, code: null }],
+    },
+  });
+  assert.doesNotMatch(
+    JSON.stringify(details),
+    /store\.example|secret-token|secret-hmac|requestUrl/i,
+  );
+});
+
+test("Finance GraphQL logging rethrows the original error", async () => {
+  const originalError = new Error("Network failure");
+  const originalConsoleError = console.error;
+  console.error = () => {};
+
+  try {
+    await assert.rejects(
+      executeFinanceGraphql(
+        { graphql: async () => Promise.reject(originalError) },
+        "FinanceOrders",
+        "query FinanceOrders { shop { id } }",
+      ),
+      (error) => error === originalError,
+    );
+  } finally {
+    console.error = originalConsoleError;
+  }
 });
