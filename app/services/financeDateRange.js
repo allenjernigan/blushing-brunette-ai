@@ -65,6 +65,8 @@ export function getFinanceDateRange({
   let start;
   let end;
   let label;
+  let shopifyqlStartDate;
+  let shopifyqlEndDate;
 
   switch (periodKey) {
     case "today":
@@ -110,7 +112,9 @@ export function getFinanceDateRange({
         );
       }
 
-      end = visibleEnd.plus({ days: 1 });
+      shopifyqlStartDate = customStart;
+      shopifyqlEndDate = customEnd;
+      end = visibleEnd.endOf("day").plus({ milliseconds: 1 });
       label = `${start.toFormat("MMMM d, yyyy")}–${visibleEnd.toFormat("MMMM d, yyyy")}`;
       break;
     }
@@ -123,8 +127,11 @@ export function getFinanceDateRange({
     label,
     start: start.toUTC().toISO(),
     end: end.toUTC().toISO(),
-    startDate: start.toFormat("yyyy-MM-dd"),
-    endDate: end.minus({ milliseconds: 1 }).toFormat("yyyy-MM-dd"),
+    startDate:
+      shopifyqlStartDate || start.toFormat("yyyy-MM-dd"),
+    endDate:
+      shopifyqlEndDate ||
+      end.minus({ milliseconds: 1 }).toFormat("yyyy-MM-dd"),
   };
 }
 export const FINANCE_PERIODS = [

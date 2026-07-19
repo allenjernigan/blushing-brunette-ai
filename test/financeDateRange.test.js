@@ -7,6 +7,7 @@ import {
   getFinanceDateRange,
   isOrderWithinDateRange,
 } from "../app/services/financeDateRange.js";
+import { buildPeriodSalesQuery } from "../app/services/financeShopifyql.js";
 import { DateTime } from "luxon";
 
 const start = "2026-07-18T04:00:00.000Z";
@@ -101,11 +102,57 @@ test("treats a custom end date as inclusive across DST", () => {
   assert.equal(range.endDate, "2026-03-08");
 });
 
+test("supports a single-day custom range", () => {
+  const range = getFinanceDateRange({
+    periodKey: "custom",
+    timezone: "America/Chicago",
+    customStart: "2026-07-15",
+    customEnd: "2026-07-15",
+  });
+
+  assert.equal(range.start, "2026-07-15T05:00:00.000Z");
+  assert.equal(range.end, "2026-07-16T05:00:00.000Z");
+  assert.equal(range.startDate, "2026-07-15");
+  assert.equal(range.endDate, "2026-07-15");
+  assert.match(
+    buildPeriodSalesQuery(range),
+    /SINCE 2026-07-15 UNTIL 2026-07-15/,
+  );
+});
+
+test("supports a two-day inclusive custom range", () => {
+  const range = getFinanceDateRange({
+    periodKey: "custom",
+    timezone: "America/Chicago",
+    customStart: "2026-07-14",
+    customEnd: "2026-07-15",
+  });
+
+  assert.equal(range.startDate, "2026-07-14");
+  assert.equal(range.endDate, "2026-07-15");
+  assert.match(
+    buildPeriodSalesQuery(range),
+    /SINCE 2026-07-14 UNTIL 2026-07-15/,
+  );
+});
+
+test("rejects a custom end date before its start date", () => {
+  assert.throws(
+    () =>
+      getFinanceDateRange({
+        periodKey: "custom",
+        timezone: "America/Chicago",
+        customStart: "2026-07-16",
+        customEnd: "2026-07-15",
+      }),
+    FinanceDateRangeError,
+  );
+});
+
 test("rejects missing, invalid, and reversed custom dates", () => {
   for (const values of [
     { customStart: "", customEnd: "2026-07-19" },
     { customStart: "2026-02-30", customEnd: "2026-03-01" },
-    { customStart: "2026-07-20", customEnd: "2026-07-19" },
   ]) {
     assert.throws(
       () =>
