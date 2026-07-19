@@ -32,13 +32,41 @@ function sanitizeErrorText(value) {
     );
 }
 
+const SENSITIVE_LOG_KEY =
+  /token|hmac|session|database.?url|request.?url|customer|email|phone|address/i;
+
+function sanitizeLogValue(value, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value ?? null;
+  if (typeof value === "string") return sanitizeErrorText(value);
+  if (["number", "boolean"].includes(typeof value)) return value;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[Circular]";
+
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeLogValue(item, seen));
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      SENSITIVE_LOG_KEY.test(key)
+        ? "[REDACTED]"
+        : sanitizeLogValue(item, seen),
+    ]),
+  );
+}
+
 function sanitizeGraphqlErrors(errors) {
   if (!Array.isArray(errors)) return null;
 
   return errors.map((error) => ({
     message: sanitizeErrorText(error?.message || error),
     path: error?.path || null,
-    code: error?.extensions?.code || null,
+    locations: sanitizeLogValue(error?.locations),
+    extensions: sanitizeLogValue(error?.extensions),
   }));
 }
 
@@ -65,10 +93,8 @@ export function getSafeGraphqlErrorDetails(error, operationName) {
     message: sanitizeErrorText(error?.message || error),
     graphQLErrors: sanitizeGraphqlErrors(error?.graphQLErrors),
     networkError: sanitizeNetworkError(error?.networkError),
-    response: {
-      status: error?.response?.status ?? null,
-      errors: sanitizeGraphqlErrors(error?.response?.errors),
-    },
+    responseStatus: error?.response?.status ?? null,
+    responseErrors: sanitizeGraphqlErrors(error?.response?.errors),
   };
 }
 
@@ -82,8 +108,12 @@ export async function executeFinanceGraphql(
     return await admin.graphql(query, options);
   } catch (error) {
     console.error(
-      "Finance GraphQL request failed",
-      getSafeGraphqlErrorDetails(error, operationName),
+      "[Finance GraphQL request failed]",
+      JSON.stringify(
+        getSafeGraphqlErrorDetails(error, operationName),
+        null,
+        2,
+      ),
     );
     throw error;
   }

@@ -132,7 +132,12 @@ test("Finance GraphQL logging exposes only approved failure details", () => {
         {
           message: "Access denied",
           path: ["shopifyqlQuery"],
-          extensions: { code: "ACCESS_DENIED", hmac: "secret-hmac" },
+          locations: [{ line: 2, column: 3 }],
+          extensions: {
+            code: "ACCESS_DENIED",
+            documentation: "https://shopify.dev/access",
+            hmac: "secret-hmac",
+          },
         },
       ],
       networkError: {
@@ -157,7 +162,12 @@ test("Finance GraphQL logging exposes only approved failure details", () => {
       {
         message: "Access denied",
         path: ["shopifyqlQuery"],
-        code: "ACCESS_DENIED",
+        locations: [{ line: 2, column: 3 }],
+        extensions: {
+          code: "ACCESS_DENIED",
+          documentation: "[REDACTED_URL]",
+          hmac: "[REDACTED]",
+        },
       },
     ],
     networkError: {
@@ -165,10 +175,15 @@ test("Finance GraphQL logging exposes only approved failure details", () => {
       message: "Connection failed",
       status: 502,
     },
-    response: {
-      status: 502,
-      errors: [{ message: "Bad gateway", path: null, code: null }],
-    },
+    responseStatus: 502,
+    responseErrors: [
+      {
+        message: "Bad gateway",
+        path: null,
+        locations: null,
+        extensions: null,
+      },
+    ],
   });
   assert.doesNotMatch(
     JSON.stringify(details),
@@ -178,8 +193,17 @@ test("Finance GraphQL logging exposes only approved failure details", () => {
 
 test("Finance GraphQL logging rethrows the original error", async () => {
   const originalError = new Error("Network failure");
+  originalError.graphQLErrors = [
+    {
+      message: "Required access: read_reports",
+      extensions: { code: "ACCESS_DENIED" },
+    },
+  ];
   const originalConsoleError = console.error;
-  console.error = () => {};
+  let loggedArguments;
+  console.error = (...argumentsToLog) => {
+    loggedArguments = argumentsToLog;
+  };
 
   try {
     await assert.rejects(
@@ -189,6 +213,13 @@ test("Finance GraphQL logging rethrows the original error", async () => {
         "query FinanceOrders { shop { id } }",
       ),
       (error) => error === originalError,
+    );
+    assert.equal(loggedArguments[0], "[Finance GraphQL request failed]");
+    assert.match(loggedArguments[1], /\n {2}"graphQLErrors": \[/);
+    assert.doesNotMatch(loggedArguments[1], /\[Array\]/);
+    assert.equal(
+      JSON.parse(loggedArguments[1]).graphQLErrors[0].extensions.code,
+      "ACCESS_DENIED",
     );
   } finally {
     console.error = originalConsoleError;
