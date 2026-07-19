@@ -2,7 +2,7 @@
 
 client_id = "bfef292ca138581f317338d2b5c60fae"
 name = "Blushing Brunette AI"
-application_url = "https://example.com"
+application_url = "https://blushing-brunette-ai.onrender.com"
 embedded = true
 
 [build]
@@ -12,7 +12,7 @@ automatically_update_urls_on_dev = true
 api_version = "2026-07"
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
 scopes = "read_orders,read_inventory,read_locations,write_metaobject_definitions,write_metaobjects,write_products"
+
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://blushing-brunette-ai.onrender.com/api/auth" ]
