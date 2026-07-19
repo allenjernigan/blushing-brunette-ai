@@ -13,7 +13,7 @@ import {
 } from "./financeFilters.js";
 import {
   aggregateSalesMetrics,
-  buildFinanceSalesQuery,
+  buildPeriodSalesQuery,
   normalizeSalesRow,
 } from "./financeShopifyql.js";
 
@@ -123,61 +123,13 @@ export async function executeFinanceGraphql(
       JSON.stringify(expandedGraphQLErrors, null, 2),
     );
     console.error("[Finance GraphQL operation]", operationName);
+    console.error(
+      "[Finance GraphQL wrapper message]",
+      error?.message,
+    );
     throw error;
   }
 }
-
-function isSameDayCustomRequest(periodKey, customStart, customEnd) {
-  return (
-    periodKey === "custom" &&
-    /^\d{4}-\d{2}-\d{2}$/.test(customStart || "") &&
-    customStart === customEnd
-  );
-}
-
-function logFinanceOperation(operationName, shopifyqlQueryString) {
-  console.error("[Finance GraphQL operation]", operationName);
-
-  if (shopifyqlQueryString) {
-    console.error(
-      "[Finance ShopifyQL query]",
-      shopifyqlQueryString,
-    );
-  }
-}
-
-const SHOPIFYQL_GRAPHQL_OPERATIONS = {
-  FinanceChannels: `#graphql
-    query FinanceChannels($query: String!) {
-      shopifyqlQuery(query: $query) {
-        parseErrors
-        tableData {
-          columns {
-            name
-            dataType
-            displayName
-          }
-          rows
-        }
-      }
-    }
-  `,
-  FinanceSalesTotals: `#graphql
-    query FinanceSalesTotals($query: String!) {
-      shopifyqlQuery(query: $query) {
-        parseErrors
-        tableData {
-          columns {
-            name
-            dataType
-            displayName
-          }
-          rows
-        }
-      }
-    }
-  `,
-};
 
 export function normalizeSourceName(sourceName) {
   return String(sourceName || "")
@@ -320,9 +272,7 @@ function calculateProductCosts(orders) {
   };
 }
 
-async function getShopSettings(admin, diagnostic = false) {
-  if (diagnostic) logFinanceOperation("FinanceShopSettings");
-
+async function getShopSettings(admin) {
   const response = await executeFinanceGraphql(
     admin,
     "FinanceShopSettings",
@@ -376,43 +326,39 @@ export function parseShopifyqlResult(json) {
   return result.tableData.rows || [];
 }
 
-async function runShopifyql(
-  admin,
-  operationName,
-  shopifyqlQueryString,
-  diagnostic = false,
-) {
-  if (diagnostic) {
-    logFinanceOperation(operationName, shopifyqlQueryString);
-  }
+async function runShopifyql(admin, shopifyqlQueryString, dateInputs) {
+  console.error(
+    "[Finance ShopifyQL query]",
+    shopifyqlQueryString,
+  );
+  console.error(
+    "[Finance ShopifyQL date inputs]",
+    JSON.stringify(dateInputs, null, 2),
+  );
 
   try {
-    const graphqlOperation =
-      SHOPIFYQL_GRAPHQL_OPERATIONS[operationName];
-
-    if (!graphqlOperation) {
-      throw new Error(
-        `Unknown Finance ShopifyQL operation: ${operationName}`,
-      );
-    }
-
-    const response = await admin.graphql(
-      graphqlOperation,
+    const response = await executeFinanceGraphql(
+      admin,
+      "FinanceShopifyql",
+      `#graphql
+        query FinanceShopifyql($query: String!) {
+          shopifyqlQuery(query: $query) {
+            parseErrors
+            tableData {
+              columns {
+                name
+                dataType
+                displayName
+              }
+              rows
+            }
+          }
+        }
+      `,
       { variables: { query: shopifyqlQueryString } },
     );
-    const json = await response.json();
-    const parseErrors = json.data?.shopifyqlQuery?.parseErrors || [];
 
-    if (parseErrors.length) {
-      console.error("[Finance GraphQL operation]", operationName);
-      console.error("[Finance ShopifyQL query]", shopifyqlQueryString);
-      console.error(
-        "[Finance ShopifyQL parseErrors]",
-        JSON.stringify(parseErrors, null, 2),
-      );
-    }
-
-    return parseShopifyqlResult(json);
+    return parseShopifyqlResult(await response.json());
   } catch (error) {
     const expandedGraphQLErrors = Array.isArray(error?.graphQLErrors)
       ? error.graphQLErrors.map((item) => ({
@@ -429,24 +375,22 @@ async function runShopifyql(
       "[Finance GraphQL errors expanded]",
       JSON.stringify(expandedGraphQLErrors, null, 2),
     );
-    console.error("[Finance GraphQL operation]", operationName);
-    console.error("[Finance ShopifyQL query]", shopifyqlQueryString);
     throw error;
   }
 }
 
-async function getSalesChannels(admin, diagnostic = false) {
+async function getSalesChannels(admin) {
   const shopifyqlQueryString = `FROM sales
       SHOW total_sales, orders
       GROUP BY sales_channel, is_pos_sale
       SINCE 2000-01-01 UNTIL today
       ORDER BY total_sales DESC`;
-  const rows = await runShopifyql(
-    admin,
-    "FinanceChannels",
-    shopifyqlQueryString,
-    diagnostic,
-  );
+  const rows = await runShopifyql(admin, shopifyqlQueryString, {
+    period: "channel-discovery",
+    start: "2000-01-01",
+    end: "today",
+    dateClause: "SINCE 2000-01-01 UNTIL today",
+  });
 
   const channelsByKey = new Map();
 
@@ -470,14 +414,14 @@ async function getSalesChannels(admin, diagnostic = false) {
   return Array.from(channelsByKey.values());
 }
 
-async function getPeriodChannelSales(admin, period, diagnostic = false) {
-  const shopifyqlQueryString = buildFinanceSalesQuery(period);
-  const rows = await runShopifyql(
-    admin,
-    "FinanceSalesTotals",
-    shopifyqlQueryString,
-    diagnostic,
-  );
+async function getPeriodChannelSales(admin, period) {
+  const shopifyqlQueryString = buildPeriodSalesQuery(period);
+  const rows = await runShopifyql(admin, shopifyqlQueryString, {
+    period: period.key,
+    start: period.startDate,
+    end: period.endDate,
+    dateClause: `SINCE ${period.startDate} UNTIL ${period.endDate}`,
+  });
 
   return rows.map((row) => ({
     channel: normalizeShopifyChannel(row.sales_channel),
@@ -485,7 +429,7 @@ async function getPeriodChannelSales(admin, period, diagnostic = false) {
   }));
 }
 
-async function getOrdersForRange(admin, start, end, diagnostic = false) {
+async function getOrdersForRange(admin, start, end) {
   const orders = [];
   let hasNextPage = true;
   let cursor = null;
@@ -493,8 +437,6 @@ async function getOrdersForRange(admin, start, end, diagnostic = false) {
   const searchQuery = buildProcessedAtRangeQuery(start, end);
 
   while (hasNextPage) {
-    if (diagnostic) logFinanceOperation("FinanceOrders");
-
     const response = await executeFinanceGraphql(
       admin,
       "FinanceOrders",
@@ -702,7 +644,6 @@ async function getOrdersForRange(admin, start, end, diagnostic = false) {
         order.id,
         order.lineItems.nodes,
         order.lineItems.pageInfo,
-        diagnostic,
       );
 
       if (isOrderWithinDateRange(order, start, end)) {
@@ -722,15 +663,12 @@ async function getRemainingOrderLineItems(
   orderId,
   initialItems,
   initialPageInfo,
-  diagnostic = false,
 ) {
   const lineItems = [...initialItems];
   let hasNextPage = initialPageInfo.hasNextPage;
   let cursor = initialPageInfo.endCursor;
 
   while (hasNextPage) {
-    if (diagnostic) logFinanceOperation("FinanceOrderLineItems");
-
     const response = await executeFinanceGraphql(
       admin,
       "FinanceOrderLineItems",
@@ -828,13 +766,8 @@ export async function getFinanceSales(
     requestedChannels = null,
   } = {},
 ) {
-  const sameDayCustom = isSameDayCustomRequest(
-    periodKey,
-    customStart,
-    customEnd,
-  );
-  const shop = await getShopSettings(admin, sameDayCustom);
-  const channels = await getSalesChannels(admin, sameDayCustom);
+  const shop = await getShopSettings(admin);
+  const channels = await getSalesChannels(admin);
   const channelByKey = new Map(
     channels.map((channel) => [channel.key, channel]),
   );
@@ -870,29 +803,12 @@ export async function getFinanceSales(
     };
   }
 
-  let rawOrders = [];
-  let shopifyChannelSales = [];
-
-  if (!dateError) {
-    if (sameDayCustom) {
-      shopifyChannelSales = await getPeriodChannelSales(
-        admin,
-        period,
-        true,
-      );
-      rawOrders = await getOrdersForRange(
-        admin,
-        period.start,
-        period.end,
-        true,
-      );
-    } else {
-      [rawOrders, shopifyChannelSales] = await Promise.all([
+  const [rawOrders, shopifyChannelSales] = dateError
+    ? [[], []]
+    : await Promise.all([
         getOrdersForRange(admin, period.start, period.end),
         getPeriodChannelSales(admin, period),
       ]);
-    }
-  }
   const allOrders = rawOrders.map((order) =>
     withChannelClassification(order, channelByKey),
   );
@@ -943,9 +859,7 @@ export async function getFinanceSales(
     selectedChannels,
     shopifyMetrics: aggregateSalesMetrics(
       shopifyChannelSales,
-      sameDayCustom
-        ? shopifyChannelSales.map((summary) => summary.channel.key)
-        : selectedChannels,
+      selectedChannels,
     ),
     channelBreakdown,
     dateError,

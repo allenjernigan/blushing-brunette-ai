@@ -20,24 +20,6 @@ export function buildPeriodSalesQuery(period) {
       ORDER BY total_sales DESC`;
 }
 
-export function buildSingleDaySalesQuery(date) {
-  return `FROM sales
-      SHOW gross_sales, discounts, sales_reversals, net_sales, shipping_charges, shipping_reversals, taxes, total_sales
-      SINCE ${date} UNTIL ${date}
-  `;
-}
-
-export function buildFinanceSalesQuery(period) {
-  if (
-    period.key === "custom" &&
-    period.startDate === period.endDate
-  ) {
-    return buildSingleDaySalesQuery(period.startDate);
-  }
-
-  return buildPeriodSalesQuery(period);
-}
-
 export function normalizeSalesRow(row) {
   return {
     grossSales: Number(row.gross_sales || 0),

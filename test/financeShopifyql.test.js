@@ -8,7 +8,6 @@ import {
 } from "../app/services/finance.server.js";
 import {
   aggregateSalesMetrics,
-  buildFinanceSalesQuery,
   buildPeriodSalesQuery,
   calculateWaterfallTotal,
   normalizeSalesRow,
@@ -39,22 +38,6 @@ test("queries current ShopifyQL sales reversals and shipping metrics", () => {
   assert.match(query, /average_order_value/);
   assert.match(query, /SINCE 2026-07-01 UNTIL 2026-07-19/);
   assert.doesNotMatch(query, /\breturns\b/);
-});
-
-test("builds a dedicated absolute single-day ShopifyQL query", () => {
-  const query = buildFinanceSalesQuery({
-    key: "custom",
-    startDate: "2026-07-16",
-    endDate: "2026-07-16",
-  });
-
-  assert.match(query, /SINCE 2026-07-16 UNTIL 2026-07-16/);
-  assert.match(
-    query,
-    /SHOW gross_sales, discounts, sales_reversals, net_sales, shipping_charges, shipping_reversals, taxes, total_sales/,
-  );
-  assert.doesNotMatch(query, /GROUP BY|duties|additional_fees|average_order_value/);
-  assert.doesNotMatch(query, /2026-07-15|2026-07-17|T00:00|Z/);
 });
 
 test("preserves negative reversal signs without double subtraction", () => {
@@ -245,7 +228,10 @@ test("Finance GraphQL logging rethrows the original error", async () => {
       "[Finance GraphQL operation]",
       "FinanceOrders",
     ]);
-    assert.equal(loggedCalls.length, 2);
+    assert.deepEqual(loggedCalls[2], [
+      "[Finance GraphQL wrapper message]",
+      "Network failure",
+    ]);
   } finally {
     console.error = originalConsoleError;
   }
